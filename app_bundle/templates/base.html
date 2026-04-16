@@ -1,0 +1,293 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>{{ title }}</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: "Segoe UI", "Helvetica Neue", Arial, "PingFang SC", "Microsoft YaHei", sans-serif;
+      background: #eef3f8;
+      color: #24384b;
+    }
+    a { text-decoration: none; color: inherit; }
+    .app { display: flex; min-height: 100vh; }
+
+    .sidebar {
+      width: 248px;
+      background: linear-gradient(180deg,#dce9f4 0%,#d4e3f1 100%);
+      border-right: 1px solid #c7d8e8;
+      padding: 10px 0 18px;
+      transition: transform .25s ease;
+    }
+    .sidebar.collapsed { transform: translateX(-172px); }
+    .brand { display: flex; align-items: center; gap: 10px; padding: 12px 16px; border-bottom: 1px solid rgba(180,201,221,.6); position: relative; }
+    .brand-avatar { width: 40px; height: 40px; border-radius: 50%; background: #fff; display: flex; align-items: center; justify-content: center; border: 1px solid #bed0e1; }
+    .brand-title { font-size: 14px; font-weight: 800; color: #183148; }
+    .brand-sub { font-size: 11px; color: #678096; margin-top: 2px; }
+    .sidebar-toggle { position: absolute; right: 10px; top: 12px; width: 22px; height: 22px; border: 1px solid #b7cbe0; border-radius: 5px; background: #fff; color: #5c7690; cursor: pointer; }
+
+    .menu { margin-top: 8px; }
+    .menu-item, .submenu-item {
+      display: flex; align-items: center; justify-content: space-between;
+      padding: 12px 18px; cursor: pointer;
+    }
+    .menu-item-left, .submenu-left { display: flex; align-items: center; gap: 10px; }
+    .icon-box {
+      width: 16px;
+      height: 16px;
+      border: 1.8px solid #21384e;
+      border-radius: 3px;
+      opacity: .85;
+      position: relative;
+      flex-shrink: 0;
+    }
+    .icon-home::before, .icon-chart::before, .icon-user::before, .icon-sub::before {
+      content: "";
+      position: absolute;
+      inset: 3px;
+      border-radius: 1px;
+      background: #21384e;
+      opacity: .85;
+    }
+    .menu-item.active-top { background: rgba(255,255,255,.58); font-weight: 700; color: #1a3958; }
+    .menu-item:hover, .submenu-item:hover { background: rgba(255,255,255,.45); }
+    .submenu-wrap { margin: 2px 10px 8px; border-radius: 8px; background: rgba(255,255,255,.18); padding: 4px 0; }
+    .submenu-item.active { background: #f4f9ff; color: #1c6db2; font-weight: 700; }
+    .menu-toggle { border: none; background: transparent; width: 100%; text-align: left; }
+    .arrow { color: #6f8499; font-size: 12px; transition: transform .2s ease; }
+    .arrow.collapsed { transform: rotate(-90deg); }
+    .sidebar.collapsed .brand-text, .sidebar.collapsed .submenu-wrap, .sidebar.collapsed .menu-item span { display: none !important; }
+
+    .main { flex: 1; padding: 14px; }
+    .topbar {
+      height: 58px;
+      background: linear-gradient(180deg,#d9ecfb 0%,#d6e8f7 100%);
+      border: 1px solid #cadcec;
+      border-radius: 10px;
+      display: flex; align-items: center; justify-content: space-between;
+      padding: 0 16px 0 18px; margin-bottom: 12px;
+    }
+    .topbar-title { font-size: 15px; font-weight: 800; color: #1d354a; }
+    .topbar-sub { font-size: 12px; color: #698096; margin-top: 2px; }
+    .topbar-user { width: 36px; height: 36px; border-radius: 50%; border: 1px solid #c4d7e8; background: #fff3d6; display: flex; align-items: center; justify-content: center; }
+
+    .panel { background: #fff; border: 1px solid #dbe7f2; border-radius: 8px; margin-bottom: 10px; box-shadow: 0 1px 4px rgba(60,92,128,.04); }
+    .panel-header { padding: 14px 16px; font-size: 14px; font-weight: 900; border-bottom: 1px solid #edf2f8; }
+    .panel-sub { padding: 10px 16px 0; color: #7890a6; font-size: 12px; }
+    .chart-wrap { padding: 12px 14px 14px; }
+    .chart-box { height: 320px; }
+    .chart-box-sm { height: 210px; }
+    .chart-box-lg { height: 420px; }
+    .chart-box-portrait { height: 430px; width: 100%; max-width: 1120px; margin: 0 auto; }
+
+    .grid-5 { display: grid; grid-template-columns: repeat(5,1fr); gap: 10px; margin-bottom: 10px; }
+    .grid-4 { display: grid; grid-template-columns: repeat(4,1fr); gap: 10px; margin-bottom: 10px; }
+    .grid-3 { display: grid; grid-template-columns: repeat(3,1fr); gap: 10px; margin-bottom: 10px; }
+    .grid-2 { display: grid; grid-template-columns: repeat(2,1fr); gap: 10px; margin-bottom: 10px; }
+    .content-grid { display: grid; grid-template-columns: 1.45fr 0.85fr; gap: 10px; }
+
+    .stat-card { background: #fff; border: 1px solid #dbe7f2; border-radius: 8px; padding: 14px; }
+    .stat-label { font-size: 12px; color: #70859a; margin-bottom: 8px; }
+    .stat-value { font-size: 24px; font-weight: 900; color: #1f364c; margin-bottom: 6px; }
+    .stat-desc { font-size: 12px; color: #93a3b3; }
+
+    .table-box { padding: 12px 14px 14px; overflow-x: auto; }
+    table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    th, td { padding: 10px; border-bottom: 1px solid #e7eff6; text-align: left; white-space: nowrap; color: #3c556d; }
+    th { background: #f7fbff; color: #667f97; font-weight: 900; }
+
+    .badge { display: inline-block; padding: 4px 10px; border-radius: 999px; font-size: 12px; font-weight: 900; }
+    .high { background: #ffe6e6; color: #c93c3c; }
+    .medium { background: #fff2df; color: #bb7a16; }
+    .low { background: #e5f6ea; color: #218553; }
+
+    .warn-list { padding: 12px 14px 14px; }
+    .warn-item { background: #fff8ef; border: 1px solid #f1dfc6; border-radius: 8px; padding: 12px; margin-bottom: 10px; }
+    .warn-name { font-size: 13px; font-weight: 900; color: #224057; margin-bottom: 4px; }
+    .warn-text { font-size: 12px; color: #7c6344; line-height: 1.7; }
+
+    .toolbar { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; padding: 12px 16px; }
+    .btn { height: 32px; padding: 0 14px; border: none; border-radius: 6px; color: #fff; font-size: 13px; font-weight: 900; cursor: pointer; }
+    .btn-blue { background: #4d9ae8; }
+    .btn-gray { background: #8ea2b6; }
+    input[type=text], select { min-width: 128px; height: 32px; border: 1px solid #bfd4e6; border-radius: 6px; padding: 0 10px; }
+    .field { display: flex; align-items: center; gap: 8px; font-size: 13px; color: #556c83; }
+
+    .shap-frame { background: #ececec; border: 1px solid #d2d2d2; border-radius: 8px; padding: 12px; display: grid; grid-template-columns: minmax(0,1fr) 26px; gap: 14px; align-items: stretch; }
+    .shap-colorbar { border-radius: 4px; background: linear-gradient(180deg,#ff005a 0%,#1e88e5 100%); position: relative; }
+    .shap-high, .shap-low, .shap-label { position: absolute; right: -54px; color: #2e2e2e; }
+    .shap-high { top: -2px; }
+    .shap-low { bottom: -2px; }
+    .shap-label { top: 50%; transform: translateY(-50%) rotate(180deg); writing-mode: vertical-rl; }
+
+    @media (max-width: 1360px){
+      .grid-5 { grid-template-columns: repeat(3,1fr); }
+      .grid-4 { grid-template-columns: repeat(2,1fr); }
+      .grid-3 { grid-template-columns: repeat(2,1fr); }
+      .grid-2, .content-grid { grid-template-columns: 1fr; }
+      .shap-frame { grid-template-columns: minmax(0,1fr) 22px; }
+    }
+  </style>
+</head>
+<body>
+<div class="app">
+  <aside class="sidebar" id="sidebar">
+    <div class="brand">
+      <div class="brand-avatar">👨</div>
+      <div class="brand-text">
+        <div class="brand-title">{{ brand_title }}</div>
+        <div class="brand-sub">{{ brand_sub }}</div>
+      </div>
+      <button class="sidebar-toggle" id="sidebarToggle">◀</button>
+    </div>
+
+    <div class="menu">
+      <a class="menu-item {{ 'active-top' if active_menu=='home' else '' }}" href="{{ url_for('home') }}">
+        <div class="menu-item-left"><div class="icon-box icon-home"></div><span>{{ menu_home }}</span></div>
+      </a>
+      <a class="menu-item {{ 'active-top' if active_menu=='dashboard' else '' }}" href="{{ url_for('dashboard') }}">
+        <div class="menu-item-left"><div class="icon-box icon-chart"></div><span>{{ menu_dashboard }}</span></div>
+      </a>
+      <button class="menu-item menu-toggle {{ 'active-top' if active_menu=='analysis' else '' }}" id="analyticsToggle">
+        <div class="menu-item-left"><div class="icon-box icon-chart"></div><span>{{ menu_analytics }}</span></div>
+        <span class="arrow" id="analyticsArrow">▾</span>
+      </button>
+      <div class="submenu-wrap" id="analyticsSubmenu">{{ submenu_html|safe }}</div>
+      <a class="menu-item {{ 'active-top' if active_menu=='employee' else '' }}" href="{{ url_for('employee_management') }}">
+        <div class="menu-item-left"><div class="icon-box icon-user"></div><span>{{ menu_employee }}</span></div>
+      </a>
+    </div>
+  </aside>
+
+  <main class="main">
+    <div class="topbar">
+      <div>
+        <div class="topbar-title">{{ title }}</div>
+        <div class="topbar-sub">{{ subtitle }}</div>
+      </div>
+      <div class="topbar-user">👤</div>
+    </div>
+    {{ content_html|safe }}
+  </main>
+</div>
+
+<script>
+const CHARTS = {{ charts_json|safe }};
+
+function buildChartFromCfg(id, cfg) {
+  const el = document.getElementById(id);
+  if (!el || !cfg) return;
+  const chartHost = el.parentElement;
+
+  if (cfg.canvasHeight && chartHost) {
+    chartHost.style.height = `${cfg.canvasHeight}px`;
+  }
+
+  const baseOptions = {
+    responsive: true,
+    maintainAspectRatio: false,
+    plugins: {
+      legend: { display: true, labels: { color: "#5e7388", boxWidth: 14 } },
+      tooltip: { backgroundColor: "#2f4358", titleColor: "#fff", bodyColor: "#fff" }
+    },
+    scales: {
+      x: { grid: { display: false }, ticks: { color: "#6c8297" } },
+      y: { beginAtZero: true, grid: { color: "#eef3f7" }, ticks: { color: "#6c8297" } }
+    }
+  };
+
+  const options = Object.assign({}, baseOptions, cfg.options || {});
+
+  if (cfg.xLabels && cfg.xLabels.length) {
+    options.scales = options.scales || {};
+    options.scales.x = Object.assign({}, options.scales.x || {}, {
+      type: "linear",
+      min: -0.5,
+      max: cfg.xLabels.length - 0.5,
+      ticks: {
+        color: "#6c8297",
+        callback: (value) => {
+          const i = Math.round(Number(value));
+          if (Math.abs(Number(value) - i) < 0.2 && i >= 0 && i < cfg.xLabels.length) return cfg.xLabels[i];
+          return "";
+        }
+      }
+    });
+  }
+
+  if (cfg.featureLabels && cfg.featureLabels.length) {
+    options.scales = options.scales || {};
+    options.scales.y = Object.assign({}, options.scales.y || {}, {
+      type: "linear",
+      min: -0.5,
+      max: cfg.featureLabels.length - 0.5,
+      reverse: cfg.yReverse !== false,
+      ticks: {
+        color: "#5a6673",
+        autoSkip: false,
+        padding: 10,
+        callback: (value) => {
+          const i = Math.round(Number(value));
+          if (Math.abs(Number(value) - i) < 0.2 && i >= 0 && i < cfg.featureLabels.length) return cfg.featureLabels[i];
+          return "";
+        }
+      }
+    });
+  }
+
+  if (cfg.yLabels && cfg.yLabels.length) {
+    options.scales = options.scales || {};
+    options.scales.y = Object.assign({}, options.scales.y || {}, {
+      type: "linear",
+      min: -0.5,
+      max: cfg.yLabels.length - 0.5,
+      reverse: !!cfg.yReverse,
+      ticks: {
+        color: "#6c8297",
+        callback: (value) => {
+          const i = Math.round(Number(value));
+          if (Math.abs(Number(value) - i) < 0.2 && i >= 0 && i < cfg.yLabels.length) return cfg.yLabels[i];
+          return "";
+        }
+      }
+    });
+  }
+
+  new Chart(el.getContext("2d"), {
+    type: cfg.type || "bar",
+    data: {
+      labels: cfg.labels || [],
+      datasets: (cfg.datasets || []).map(ds => Object.assign({}, ds, { borderWidth: ds.borderWidth ?? 2 }))
+    },
+    options
+  });
+}
+
+Object.keys(CHARTS || {}).forEach((id) => buildChartFromCfg(id, CHARTS[id]));
+
+const sidebar = document.getElementById("sidebar");
+const sidebarToggle = document.getElementById("sidebarToggle");
+const analyticsToggle = document.getElementById("analyticsToggle");
+const analyticsSubmenu = document.getElementById("analyticsSubmenu");
+const analyticsArrow = document.getElementById("analyticsArrow");
+
+if (sidebarToggle) {
+  sidebarToggle.addEventListener("click", () => {
+    sidebar.classList.toggle("collapsed");
+  });
+}
+
+if (analyticsToggle && analyticsSubmenu && analyticsArrow) {
+  let open = true;
+  analyticsToggle.addEventListener("click", () => {
+    open = !open;
+    analyticsSubmenu.style.display = open ? "block" : "none";
+    analyticsArrow.classList.toggle("collapsed", !open);
+  });
+}
+</script>
+</body>
+</html>
