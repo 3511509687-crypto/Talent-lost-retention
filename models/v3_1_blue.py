@@ -6,6 +6,69 @@ import logging
 import re
 import warnings
 warnings.filterwarnings("ignore")
+
+PROJECT_BOOTSTRAP_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+MODEL_CACHE_DIR_ENV = "HR_MODEL_CACHE_DIR"
+MODEL_TEMP_DIR_ENV = "HR_MODEL_TEMP_DIR"
+
+
+def configure_model_runtime_dirs(cache_root=None, temp_root=None, environ=None, create_dirs=True):
+    """Route model caches and temp files to the project workspace by default."""
+    environ = os.environ if environ is None else environ
+    resolved_cache_root = os.path.abspath(os.path.expanduser(os.fspath(
+        cache_root or environ.get(MODEL_CACHE_DIR_ENV) or os.path.join(PROJECT_BOOTSTRAP_ROOT, "model_cache")
+    )))
+    resolved_temp_root = os.path.abspath(os.path.expanduser(os.fspath(
+        temp_root or environ.get(MODEL_TEMP_DIR_ENV) or os.path.join(PROJECT_BOOTSTRAP_ROOT, "runtime_tmp")
+    )))
+
+    huggingface_home = os.path.join(resolved_cache_root, "huggingface")
+    path_map = {
+        "cache_root": resolved_cache_root,
+        "temp_root": resolved_temp_root,
+        "HF_HOME": huggingface_home,
+        "HF_HUB_CACHE": os.path.join(huggingface_home, "hub"),
+        "HUGGINGFACE_HUB_CACHE": os.path.join(huggingface_home, "hub"),
+        "TRANSFORMERS_CACHE": os.path.join(huggingface_home, "transformers"),
+        "SENTENCE_TRANSFORMERS_HOME": os.path.join(resolved_cache_root, "sentence_transformers"),
+        "TORCH_HOME": os.path.join(resolved_cache_root, "torch"),
+        "XDG_CACHE_HOME": resolved_cache_root,
+        "TEMP": resolved_temp_root,
+        "TMP": resolved_temp_root,
+        "TMPDIR": resolved_temp_root,
+    }
+
+    for key, path in path_map.items():
+        if key in {"cache_root", "temp_root"}:
+            continue
+        if key in {"TEMP", "TMP", "TMPDIR"}:
+            environ[key] = path
+        elif not clean_text_for_bootstrap(environ.get(key)):
+            environ[key] = path
+
+    environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
+    if create_dirs:
+        for path in set(path_map.values()):
+            os.makedirs(path, exist_ok=True)
+
+    return path_map
+
+
+def clean_text_for_bootstrap(value):
+    if value is None:
+        return ""
+    return re.sub(r"\s+", " ", str(value).strip())
+
+
+MODEL_RUNTIME_PATHS = configure_model_runtime_dirs()
+LOCAL_CUDA_SITE_PACKAGES = os.environ.get(
+    "HR_CUDA_SITE_PACKAGES",
+    os.path.join(PROJECT_BOOTSTRAP_ROOT, "python_cuda_packages"),
+)
+if os.path.isdir(LOCAL_CUDA_SITE_PACKAGES) and LOCAL_CUDA_SITE_PACKAGES not in sys.path:
+    sys.path.insert(0, LOCAL_CUDA_SITE_PACKAGES)
+
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -39,6 +102,11 @@ except Exception:
     shap = None
 
 try:
+    from sentence_transformers import SentenceTransformer
+except Exception:
+    SentenceTransformer = None
+
+try:
     from openpyxl import load_workbook
     from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
     from openpyxl.formatting.rule import ColorScaleRule
@@ -52,20 +120,124 @@ except Exception:
 # -----------------------
 # 获取当前代码文件所在目录（关键：所有输出都存这里）
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
-# 数据路径（改为当前目录相对路径，方便移植）
-DATA_PATH = os.path.join(CURRENT_DIR, "WA_Fn-UseC_-HR-Employee-Attrition.csv")
-POLICY_PATH = os.path.join(CURRENT_DIR, "人才政策信息表(1).xlsx")
+PROJECT_ROOT = os.path.dirname(CURRENT_DIR)
+LEGACY_EMPLOYEE_DATA_PATH = os.path.join(CURRENT_DIR, "WA_Fn-UseC_-HR-Employee-Attrition.csv")
+LEGACY_POLICY_DATA_PATH = os.path.join(CURRENT_DIR, "人才政策信息表(1).xlsx")
+DEFAULT_PROCESSED_EMPLOYEE_DIR = os.path.join(PROJECT_ROOT, "uploads", "processed", "employee")
+DEFAULT_PROCESSED_POLICY_DIR = os.path.join(PROJECT_ROOT, "uploads", "processed", "policy")
+
+
+def latest_input_file(base_dir, patterns):
+    """返回目录中匹配模式的最新文件；没有则返回None。"""
+    resolved_dir = os.path.abspath(os.path.expanduser(os.fspath(base_dir)))
+    if not os.path.isdir(resolved_dir):
+        return None
+    candidates = []
+    for pattern in patterns:
+        candidates.extend(glob.glob(os.path.join(resolved_dir, pattern)))
+    candidates = [path for path in candidates if os.path.isfile(path)]
+    if not candidates:
+        return None
+    return os.path.abspath(max(candidates, key=lambda path: (os.path.getmtime(path), path)))
+
+
+def resolve_default_input_path(processed_dir, patterns, fallback_path, env_var_name=None):
+    """解析本地直接运行的默认输入：环境变量 > 最新标准化数据 > 旧内置样本。"""
+    if env_var_name:
+        override_path = os.environ.get(env_var_name, "").strip()
+        if override_path:
+            return os.path.abspath(os.path.expanduser(override_path))
+    latest_path = latest_input_file(processed_dir, patterns)
+    if latest_path:
+        return latest_path
+    return os.path.abspath(os.path.expanduser(os.fspath(fallback_path)))
+
+
+# 直接运行 v3_1_blue.py 时默认使用最新标准化数据，旧样本仅作为兜底。
+DATA_PATH = resolve_default_input_path(
+    DEFAULT_PROCESSED_EMPLOYEE_DIR,
+    ("*_standardized.csv", "*.csv"),
+    LEGACY_EMPLOYEE_DATA_PATH,
+    env_var_name="HR_EMPLOYEE_DATA_PATH",
+)
+POLICY_PATH = resolve_default_input_path(
+    DEFAULT_PROCESSED_POLICY_DIR,
+    ("*_standardized.xlsx", "*.xlsx", "*.xls", "*.csv"),
+    LEGACY_POLICY_DATA_PATH,
+    env_var_name="HR_POLICY_DATA_PATH",
+)
 # 其他配置
 RANDOM_STATE = 42
 TEST_SIZE = 0.2
 TIME_DECAY_HALF_LIFE_DAYS = 180
 DROP_COLS = ["EmployeeNumber", "Over18", "StandardHours", "DailyRate", "HourlyRate"]
+DEFAULT_SEED_STABILITY_SEEDS = [13, 21, 42, 52, 66]
+LGB_REGULARIZED_PARAM_DIST = {
+    "num_leaves": [7, 15, 233],
+    "learning_rate": [0.02, 0.03, 0.04],
+    "n_estimators": [100, 150, 200, 250],
+    "max_depth": [2, 3, 4],
+    "min_child_samples": [40, 60, 80, 100],
+    "subsample": [0.60, 0.70, 0.80],
+    "colsample_bytree": [0.50, 0.60, 0.70],
+    "reg_alpha": [1.0, 2.0, 4.0, 8.0],
+    "reg_lambda": [2.0, 4.0, 6.0, 8.0],
+    "min_split_gain": [0.1, 0.2, 0.3, 0.4],
+}
+LGB_EARLY_STOPPING_VALID_SIZE = 0.18
+LGB_EARLY_STOPPING_ROUNDS = 30
+SHAP_TOP3_MAX_ROWS = int(os.environ.get("HR_SHAP_TOP3_MAX_ROWS", "5000"))
+RISK_SEGMENT_TARGET_SHARE = float(os.environ.get("HR_RISK_SEGMENT_TARGET_SHARE", "0.30"))
+PRED_POSITIVE_RATE_MIN = float(os.environ.get("HR_PRED_POSITIVE_RATE_MIN", "0.15"))
+PRED_POSITIVE_RATE_MAX = float(os.environ.get("HR_PRED_POSITIVE_RATE_MAX", "0.25"))
+PRED_POSITIVE_RATE_MULTIPLIER = float(os.environ.get("HR_PRED_POSITIVE_RATE_MULTIPLIER", "4.0"))
+TOPK_EVAL_RATES_TEXT = os.environ.get("HR_TOPK_EVAL_RATES", "0.05,0.10,0.15,0.20")
+PRIORITY_INTERVENTION_SHARE = float(os.environ.get("HR_PRIORITY_INTERVENTION_SHARE", "0.08"))
+WATCHLIST_SHARE = float(os.environ.get("HR_WATCHLIST_SHARE", "0.20"))
+GENERALIZATION_WARN_AUC_GAP = float(os.environ.get("HR_GENERALIZATION_WARN_AUC_GAP", "0.05"))
+ET_REGULARIZED_PARAMS = {
+    "n_estimators": 200,
+    "max_depth": 5,
+    "min_samples_split": 15,
+    "min_samples_leaf": 8,
+    "max_features": "sqrt",
+    "bootstrap": True,
+    "oob_score": True,
+}
+DEFAULT_SENTENCE_BERT_MODEL = os.environ.get(
+    "HR_SENTENCE_BERT_MODEL",
+    "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
+)
+FALLBACK_SENTENCE_BERT_MODELS = [
+    DEFAULT_SENTENCE_BERT_MODEL,
+    "paraphrase-multilingual-MiniLM-L12-v2",
+    "sentence-transformers/distiluse-base-multilingual-cased-v2",
+]
+DEFAULT_BERT_MODEL_NAME = os.environ.get("HR_BERT_MODEL_NAME", "bert-base-chinese")
+TEXT_ENCODER_DEVICE_ENV = "HR_TEXT_ENCODER_DEVICE"
+TEXT_ENCODER_BATCH_SIZE_ENV = "HR_TEXT_ENCODER_BATCH_SIZE"
 
 # 日志配置
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s", datefmt="%H:%M:%S")
 # Joblib临时目录（放入当前目录，避免权限问题）
 os.makedirs(os.path.join(CURRENT_DIR, "temp_joblib"), exist_ok=True)
 os.environ["JOBLIB_TEMP_FOLDER"] = os.path.join(CURRENT_DIR, "temp_joblib")
+
+
+def resolve_parallel_n_jobs():
+    """统一解析模型并行度，Windows下默认退回单进程以避免joblib权限问题。"""
+    raw_value = str(os.environ.get("HR_MODEL_N_JOBS", "")).strip()
+    if raw_value:
+        try:
+            parsed = int(raw_value)
+            if parsed != 0:
+                return parsed
+        except Exception:
+            logging.warning("HR_MODEL_N_JOBS=%s 无法解析，回退到默认并行度", raw_value)
+    return 1 if os.name == "nt" else -1
+
+
+MODEL_PARALLEL_N_JOBS = resolve_parallel_n_jobs()
 
 # 可视化全局设置（解决中文乱码、图表美观）
 plt.rcParams['font.sans-serif'] = ['SimHei', 'Arial Unicode MS', 'DejaVu Sans']
@@ -99,6 +271,48 @@ def safe_float(value):
         return float(value)
     except Exception:
         return None
+
+
+def normalize_random_state(random_state=None):
+    """统一规范随机种子输入，缺失时回退到全局默认值。"""
+    try:
+        return int(RANDOM_STATE if random_state is None else random_state)
+    except Exception:
+        return int(RANDOM_STATE)
+
+
+def parse_seed_list(seed_values=None, fallback=None):
+    """解析seed列表，支持逗号分隔字符串、列表或单个整数。"""
+    if fallback is None:
+        fallback = DEFAULT_SEED_STABILITY_SEEDS
+
+    if seed_values is None:
+        candidates = list(fallback)
+    elif isinstance(seed_values, (list, tuple, set, np.ndarray, pd.Series)):
+        candidates = list(seed_values)
+    else:
+        raw_text = str(seed_values).strip()
+        if not raw_text:
+            candidates = list(fallback)
+        else:
+            normalized_text = re.sub(r"[;|]+", ",", raw_text)
+            candidates = [item for item in re.split(r"[\s,]+", normalized_text) if item]
+
+    seeds = []
+    seen = set()
+    for item in candidates:
+        try:
+            seed = int(item)
+        except Exception:
+            continue
+        if seed in seen:
+            continue
+        seen.add(seed)
+        seeds.append(seed)
+
+    if not seeds:
+        return [normalize_random_state()]
+    return seeds
 
 
 def style_excel_workbook(file_path, percent_cols_map=None, heatmap_cols_map=None):
@@ -273,21 +487,77 @@ POLICY_COLUMN_CANDIDATES = {
 }
 
 JOB_ROLE_ALIAS_GROUPS = {
-    "Sales Executive": ["sales executive", "salesexecutive", "销售主管", "销售经理", "销售专员", "销售执行", "销售顾问"],
-    "Research Scientist": ["research scientist", "researchscientist", "研究科学家", "科研人员", "研发人员", "研究员"],
-    "Laboratory Technician": ["laboratory technician", "laboratorytechnician", "实验室技术员", "检验技术员", "技术员", "实验员"],
-    "Manufacturing Director": ["manufacturing director", "manufacturingdirector", "制造总监", "生产总监", "制造负责人", "生产负责人"],
-    "Healthcare Representative": ["healthcare representative", "healthcarerepresentative", "医疗代表", "医药代表", "健康顾问"],
-    "Manager": ["manager", "管理者", "经理", "主管"],
-    "Sales Representative": ["sales representative", "salesrepresentative", "销售代表", "业务代表"],
-    "Research Director": ["research director", "researchdirector", "研发总监", "研究总监", "科研总监"],
-    "Human Resources": ["human resources", "humanresources", "hr", "人力资源", "人事"]
+    "Sales Executive": [
+        "sales executive", "salesexecutive", "senior sales executive",
+        "account executive", "key account executive", "ka executive",
+        "销售主管", "销售经理", "销售专员", "销售执行", "销售顾问",
+        "客户经理", "大客户经理", "商务拓展", "商务拓展经理", "销售工程师",
+    ],
+    "Research Scientist": [
+        "research scientist", "researchscientist", "r&d scientist", "rd scientist",
+        "data scientist", "algorithm scientist", "research engineer",
+        "研究科学家", "科研人员", "研发人员", "研究员", "研发工程师",
+        "算法工程师", "数据科学家", "技术研究员", "科研工程师",
+    ],
+    "Laboratory Technician": [
+        "laboratory technician", "laboratorytechnician", "lab technician",
+        "labtechnician", "qc technician", "qa technician", "testing technician",
+        "实验室技术员", "检验技术员", "技术员", "实验员", "化验员",
+        "质检员", "检验员", "检测员", "样品检测员",
+    ],
+    "Manufacturing Director": [
+        "manufacturing director", "manufacturingdirector", "production director",
+        "operations director", "plant director", "manufacturing head",
+        "制造总监", "生产总监", "制造负责人", "生产负责人", "工厂总监",
+        "制造部负责人", "生产运营总监", "制造经理", "生产经理",
+    ],
+    "Healthcare Representative": [
+        "healthcare representative", "healthcarerepresentative", "medical representative",
+        "pharmaceutical representative", "clinical representative", "medical sales",
+        "医疗代表", "医药代表", "健康顾问", "学术代表", "学术推广",
+        "药品代表", "临床推广", "医疗销售",
+    ],
+    "Manager": [
+        "manager", "line manager", "team manager", "department manager",
+        "project manager", "ops manager", "operation manager",
+        "管理者", "经理", "主管", "团队经理", "部门经理",
+        "项目经理", "业务经理", "运营经理", "负责人",
+    ],
+    "Sales Representative": [
+        "sales representative", "salesrepresentative", "sales rep", "salesrep",
+        "account representative", "business representative", "business development representative", "bdr",
+        "销售代表", "业务代表", "业务员", "客户代表", "渠道销售",
+        "渠道代表", "地推", "市场拓展专员",
+    ],
+    "Research Director": [
+        "research director", "researchdirector", "r&d director", "rd director",
+        "head of research", "director of research", "rd lead",
+        "研发总监", "研究总监", "科研总监", "研发负责人", "研究负责人",
+        "技术总监", "研发部总监",
+    ],
+    "Human Resources": [
+        "human resources", "humanresources", "human resource",
+        "hr", "hrbp", "hr specialist", "talent acquisition", "recruiter", "people operations", "people ops",
+        "人力资源", "人事", "招聘专员", "薪酬绩效", "组织发展",
+        "人力行政", "人事专员", "人才发展", "招聘经理", "人事经理", "人力资源经理",
+    ],
 }
 
 DEPARTMENT_ALIAS_GROUPS = {
-    "Sales": ["sales", "销售", "市场销售"],
-    "Research & Development": ["researchdevelopment", "research&development", "r&d", "研发", "研究开发", "技术研发", "科研"],
-    "Human Resources": ["human resources", "humanresources", "hr", "人力资源", "人事"]
+    "Sales": [
+        "sales", "sales dept", "sales department",
+        "销售", "销售部", "营销", "营销部", "市场销售", "商务拓展",
+    ],
+    "Research & Development": [
+        "researchdevelopment", "research&development", "r&d", "rd",
+        "research and development", "engineering",
+        "研发", "研发部", "研究开发", "技术研发", "科研", "研发中心", "技术中心",
+    ],
+    "Human Resources": [
+        "human resources", "humanresources", "human resource",
+        "hr", "hrbp", "people operations", "people ops",
+        "人力资源", "人事", "人力", "人力资源部", "人事部", "组织与人才",
+    ],
 }
 
 POLICY_TOPIC_RULES = {
@@ -315,6 +585,66 @@ def clean_text(value):
     return re.sub(r"\s+", " ", text)
 
 
+def resolve_text_encoder_device(device_value=None, cuda_available=None, cuda_device_count=None):
+    """Resolve the text encoder device from HR_TEXT_ENCODER_DEVICE."""
+    raw_value = clean_text(device_value if device_value is not None else os.environ.get(TEXT_ENCODER_DEVICE_ENV, "auto"))
+    requested = raw_value.lower() or "auto"
+    cuda_available = cuda_available or torch.cuda.is_available
+    cuda_device_count = cuda_device_count or torch.cuda.device_count
+
+    if requested in {"auto", "gpu"}:
+        return "cuda:0" if cuda_available() and cuda_device_count() > 0 else "cpu"
+
+    if requested == "cpu":
+        return "cpu"
+
+    if requested == "cuda":
+        requested = "cuda:0"
+
+    if requested.startswith("cuda:"):
+        if not cuda_available():
+            raise RuntimeError(
+                f"{TEXT_ENCODER_DEVICE_ENV}={raw_value} was requested, but current PyTorch cannot use CUDA. "
+                "Install a CUDA-enabled torch build or set HR_TEXT_ENCODER_DEVICE=cpu."
+            )
+        device_index_text = requested.split(":", 1)[1]
+        try:
+            device_index = int(device_index_text)
+        except Exception as exc:
+            raise ValueError(f"Unsupported {TEXT_ENCODER_DEVICE_ENV} value: {raw_value}") from exc
+        device_count = int(cuda_device_count())
+        if device_index < 0 or device_index >= device_count:
+            raise RuntimeError(
+                f"{TEXT_ENCODER_DEVICE_ENV}={raw_value} requested CUDA device {device_index}, "
+                f"but only {device_count} CUDA device(s) are visible."
+            )
+        return requested
+
+    raise ValueError(f"Unsupported {TEXT_ENCODER_DEVICE_ENV} value: {raw_value}. Use auto, cpu, cuda, or cuda:N.")
+
+
+def resolve_text_encoder_batch_size(device_name, explicit_batch_size=None):
+    """Use a conservative default, with an env override for faster GPU encoding."""
+    if explicit_batch_size is not None:
+        try:
+            parsed = int(explicit_batch_size)
+            if parsed > 0:
+                return parsed
+        except Exception:
+            pass
+
+    raw_value = clean_text(os.environ.get(TEXT_ENCODER_BATCH_SIZE_ENV, ""))
+    if raw_value:
+        try:
+            parsed = int(raw_value)
+            if parsed > 0:
+                return parsed
+        except Exception:
+            logging.warning("%s=%s 无法解析，回退到默认编码批量大小", TEXT_ENCODER_BATCH_SIZE_ENV, raw_value)
+
+    return 32 if str(device_name).lower().startswith("cuda") else 16
+
+
 def normalize_identifier(value):
     """统一文本标识，便于列名/岗位名匹配"""
     text = clean_text(value)
@@ -323,30 +653,142 @@ def normalize_identifier(value):
     return re.sub(r"[^\u4e00-\u9fa5a-zA-Z0-9]+", "", text).lower()
 
 
-ROLE_ALIAS_TO_CANONICAL = {
-    normalize_identifier(alias): canonical
-    for canonical, aliases in JOB_ROLE_ALIAS_GROUPS.items()
-    for alias in ([canonical] + aliases)
-}
+def build_alias_lookup(alias_groups):
+    """构建 alias -> canonical 映射，优先保留先定义的规范名。"""
+    alias_map = {}
+    for canonical, aliases in alias_groups.items():
+        for alias in ([canonical] + list(aliases)):
+            alias_key = normalize_identifier(alias)
+            if alias_key and alias_key not in alias_map:
+                alias_map[alias_key] = canonical
+    return alias_map
 
-DEPARTMENT_ALIAS_TO_CANONICAL = {
-    normalize_identifier(alias): canonical
-    for canonical, aliases in DEPARTMENT_ALIAS_GROUPS.items()
-    for alias in ([canonical] + aliases)
-}
+
+def build_alias_matchers(alias_map):
+    """按 alias 长度降序排列，优先命中更具体的岗位/部门短语。"""
+    matchers = [(alias_key, canonical) for alias_key, canonical in alias_map.items() if alias_key]
+    matchers.sort(key=lambda item: len(item[0]), reverse=True)
+    return matchers
+
+
+def match_best_alias(normalized_text, alias_map, alias_matchers):
+    """先精确匹配，再做长词优先的包含匹配。"""
+    if not normalized_text:
+        return ""
+    direct = alias_map.get(normalized_text)
+    if direct:
+        return direct
+    for alias_key, canonical in alias_matchers:
+        if len(alias_key) <= 2:
+            if normalized_text == alias_key:
+                return canonical
+            continue
+        if alias_key in normalized_text:
+            return canonical
+    return ""
+
+
+ROLE_ALIAS_TO_CANONICAL = build_alias_lookup(JOB_ROLE_ALIAS_GROUPS)
+ROLE_ALIAS_MATCHERS = build_alias_matchers(ROLE_ALIAS_TO_CANONICAL)
+
+DEPARTMENT_ALIAS_TO_CANONICAL = build_alias_lookup(DEPARTMENT_ALIAS_GROUPS)
+DEPARTMENT_ALIAS_MATCHERS = build_alias_matchers(DEPARTMENT_ALIAS_TO_CANONICAL)
+
+
+def load_text_encoder():
+    """优先加载Sentence-BERT，失败后回退到通用BERT。"""
+    device_name = resolve_text_encoder_device()
+    logging.info(
+        "文本编码设备：%s | torch.cuda.is_available=%s | CUDA设备数=%s",
+        device_name,
+        torch.cuda.is_available(),
+        torch.cuda.device_count(),
+    )
+    if SentenceTransformer is not None:
+        seen = set()
+        for model_name in FALLBACK_SENTENCE_BERT_MODELS:
+            model_name = clean_text(model_name)
+            if not model_name or model_name in seen:
+                continue
+            seen.add(model_name)
+            try:
+                sentence_model = SentenceTransformer(
+                    model_name,
+                    device=device_name,
+                    cache_folder=os.environ.get("SENTENCE_TRANSFORMERS_HOME"),
+                )
+                sentence_model.eval()
+                actual_device = str(getattr(sentence_model, "device", device_name))
+                logging.info("✅ Sentence-BERT模型加载成功：%s | device=%s", model_name, actual_device)
+                return {
+                    "backend": "sentence_transformer",
+                    "backend_label": "sentence-transformer",
+                    "model_name": model_name,
+                    "device": actual_device,
+                    "tokenizer": None,
+                }, sentence_model
+            except Exception as e:
+                logging.warning("Sentence-BERT模型加载失败：%s | %s", model_name, e)
+    else:
+        logging.warning("sentence-transformers 未安装，回退到通用BERT编码器")
+
+    try:
+        tokenizer = BertTokenizer.from_pretrained(
+            DEFAULT_BERT_MODEL_NAME,
+            cache_dir=os.environ.get("TRANSFORMERS_CACHE"),
+        )
+        model = BertModel.from_pretrained(
+            DEFAULT_BERT_MODEL_NAME,
+            cache_dir=os.environ.get("TRANSFORMERS_CACHE"),
+        )
+        model = model.to(torch.device(device_name))
+        model.eval()
+        logging.info("✅ BERT模型加载成功：%s | device=%s", DEFAULT_BERT_MODEL_NAME, device_name)
+        return {
+            "backend": "bert",
+            "backend_label": "bert",
+            "model_name": DEFAULT_BERT_MODEL_NAME,
+            "device": device_name,
+            "tokenizer": tokenizer,
+        }, model
+    except Exception as e:
+        logging.error("BERT模型加载失败：%s，使用TF-IDF替代", e)
+        return {
+            "backend": "tfidf",
+            "backend_label": "tfidf",
+            "model_name": "char-tfidf",
+            "device": "cpu",
+            "tokenizer": None,
+        }, None
 
 
 def load_bert_model():
-    """加载预训练BERT模型（中文适配）"""
-    try:
-        tokenizer = BertTokenizer.from_pretrained('bert-base-chinese')
-        model = BertModel.from_pretrained('bert-base-chinese')
-        model.eval()
-        logging.info("✅ BERT模型加载成功")
-        return tokenizer, model
-    except Exception as e:
-        logging.error("BERT模型加载失败：%s，使用TF-IDF替代", e)
-        return None, None
+    """兼容旧调用入口，内部已升级为统一文本编码器加载。"""
+    return load_text_encoder()
+
+
+def get_text_encoder_info(tokenizer=None, model=None):
+    """统一抽取文本编码器元信息，便于记录和调试。"""
+    if isinstance(tokenizer, dict):
+        return {
+            "backend": tokenizer.get("backend") or ("bert" if model is not None else "tfidf"),
+            "backend_label": tokenizer.get("backend_label") or tokenizer.get("backend") or "tfidf",
+            "model_name": tokenizer.get("model_name") or ("unknown" if model is not None else "char-tfidf"),
+            "device": tokenizer.get("device") or ("cpu" if model is None else resolve_text_encoder_device()),
+        }
+    if tokenizer is not None and model is not None:
+        return {
+            "backend": "bert",
+            "backend_label": "bert",
+            "model_name": DEFAULT_BERT_MODEL_NAME,
+            "device": resolve_text_encoder_device(),
+        }
+    return {
+        "backend": "tfidf",
+        "backend_label": "tfidf",
+        "model_name": "char-tfidf",
+        "device": "cpu",
+    }
 
 
 def ensure_list(value):
@@ -405,7 +847,9 @@ def canonicalize_job_role(value):
     text = clean_text(value)
     if not text:
         return ""
-    return ROLE_ALIAS_TO_CANONICAL.get(normalize_identifier(text), text)
+    normalized = normalize_identifier(text)
+    canonical = match_best_alias(normalized, ROLE_ALIAS_TO_CANONICAL, ROLE_ALIAS_MATCHERS)
+    return canonical or text
 
 
 def job_role_to_key(value):
@@ -418,7 +862,9 @@ def canonicalize_department(value):
     text = clean_text(value)
     if not text:
         return ""
-    return DEPARTMENT_ALIAS_TO_CANONICAL.get(normalize_identifier(text), text)
+    normalized = normalize_identifier(text)
+    canonical = match_best_alias(normalized, DEPARTMENT_ALIAS_TO_CANONICAL, DEPARTMENT_ALIAS_MATCHERS)
+    return canonical or text
 
 
 def department_to_key(value):
@@ -426,13 +872,13 @@ def department_to_key(value):
     return normalize_identifier(canonicalize_department(value))
 
 
-def match_aliases_from_text(text, alias_map):
+def match_aliases_from_text(text, alias_matchers):
     """从自由文本中回捞岗位/部门别名"""
     normalized_text = normalize_identifier(text)
+    if not normalized_text:
+        return []
     matches = []
-    for alias_key, canonical in alias_map.items():
-        if not alias_key:
-            continue
+    for alias_key, canonical in alias_matchers:
         if len(alias_key) <= 2:
             if normalized_text == alias_key:
                 matches.append(canonical)
@@ -441,15 +887,28 @@ def match_aliases_from_text(text, alias_map):
     return dedupe_keep_order(matches)
 
 
-def extract_targets_from_text(explicit_value, fallback_text, canonicalize_fn, key_fn, alias_map):
+def extract_targets_from_text(explicit_value, fallback_text, canonicalize_fn, key_fn, alias_matchers):
     """优先用结构化字段抽取目标对象，缺失时再从全文回捞"""
     labels = []
+    recognized_hits = 0
     for part in split_multi_value_text(explicit_value):
-        canonical = canonicalize_fn(part)
+        raw = clean_text(part)
+        if not raw:
+            continue
+        canonical = canonicalize_fn(raw)
         if canonical:
             labels.append(canonical)
-    if not labels:
-        labels = match_aliases_from_text(fallback_text, alias_map)
+            if normalize_identifier(canonical) != normalize_identifier(raw):
+                recognized_hits += 1
+                continue
+        fuzzy_hits = match_aliases_from_text(raw, alias_matchers)
+        if fuzzy_hits:
+            labels.extend(fuzzy_hits)
+            recognized_hits += len(fuzzy_hits)
+
+    if recognized_hits == 0:
+        labels.extend(match_aliases_from_text(fallback_text, alias_matchers))
+
     labels = dedupe_keep_order(labels)
     keys = dedupe_keep_order([key_fn(label) for label in labels if key_fn(label)])
     return labels, keys
@@ -458,10 +917,10 @@ def extract_targets_from_text(explicit_value, fallback_text, canonicalize_fn, ke
 def extract_policy_targets(role_value="", department_value="", full_text=""):
     """抽取政策适用岗位和部门"""
     role_labels, role_keys = extract_targets_from_text(
-        role_value, full_text, canonicalize_job_role, job_role_to_key, ROLE_ALIAS_TO_CANONICAL
+        role_value, full_text, canonicalize_job_role, job_role_to_key, ROLE_ALIAS_MATCHERS
     )
     department_labels, department_keys = extract_targets_from_text(
-        department_value, full_text, canonicalize_department, department_to_key, DEPARTMENT_ALIAS_TO_CANONICAL
+        department_value, full_text, canonicalize_department, department_to_key, DEPARTMENT_ALIAS_MATCHERS
     )
     return pd.Series({
         "target_role_labels": role_labels,
@@ -516,15 +975,36 @@ def compute_time_weight(pub_time, newest, half_life_days):
         return 0.5
 
 
-def build_text_embeddings(texts, tokenizer=None, model=None, batch_size=16, max_length=256):
-    """统一文本向量化，BERT优先，失败回退到字符级TF-IDF"""
+def build_text_embeddings(texts, tokenizer=None, model=None, batch_size=None, max_length=256):
+    """统一文本向量化，Sentence-BERT优先，失败回退到BERT/TF-IDF。"""
     cleaned_texts = [clean_text(text) or "空文本" for text in texts]
     if not cleaned_texts:
         return np.zeros((0, 1)), "empty"
 
-    if tokenizer is not None and model is not None:
+    encoder_info = get_text_encoder_info(tokenizer, model)
+    tokenizer_obj = tokenizer.get("tokenizer") if isinstance(tokenizer, dict) else tokenizer
+    device_name = encoder_info.get("device") or resolve_text_encoder_device()
+    batch_size = resolve_text_encoder_batch_size(device_name, batch_size)
+
+    if encoder_info["backend"] == "sentence_transformer" and model is not None:
         try:
-            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            embeddings = model.encode(
+                cleaned_texts,
+                batch_size=batch_size,
+                show_progress_bar=len(cleaned_texts) > batch_size,
+                convert_to_numpy=True,
+                device=device_name,
+            )
+            embeddings = np.asarray(embeddings, dtype=float)
+            if embeddings.ndim == 1:
+                embeddings = embeddings.reshape(1, -1)
+            return embeddings, encoder_info["backend_label"]
+        except Exception as e:
+            logging.warning("Sentence-BERT批量编码失败：%s，回退BERT/TF-IDF", e)
+
+    if tokenizer_obj is not None and model is not None:
+        try:
+            device = torch.device(device_name)
             model = model.to(device)
             model.eval()
             batches = []
@@ -544,7 +1024,7 @@ def build_text_embeddings(texts, tokenizer=None, model=None, batch_size=16, max_
                 with torch.no_grad():
                     outputs = model(**inputs)
                 batches.append(outputs.last_hidden_state.mean(dim=1).cpu().numpy())
-            return np.vstack(batches), "bert"
+            return np.vstack(batches), encoder_info["backend_label"]
         except Exception as e:
             logging.warning("BERT批量编码失败：%s，回退TF-IDF", e)
 
@@ -803,9 +1283,6 @@ def plot_feature_importance(model, preprocessor, top_n=15, save_name="feature_im
     """可视化Top-N特征重要性（基于LightGBM）"""
     save_path = os.path.join(CURRENT_DIR, save_name)
     try:
-        # 获取LightGBM子模型
-        lgb_model = model.named_estimators_['lgb']
-
         # 提取特征名（处理数值+类别特征）
         feature_names = []
         for name, trans, cols in preprocessor.transformers_:
@@ -816,7 +1293,9 @@ def plot_feature_importance(model, preprocessor, top_n=15, save_name="feature_im
                 feature_names.extend(ohe.get_feature_names_out(cols))
 
         # 计算并排序特征重要性
-        importances = lgb_model.feature_importances_
+        importances = get_aggregated_lgb_importances(model)
+        if importances is None:
+            raise RuntimeError("未能获取LightGBM特征重要性")
         feat_imp = pd.DataFrame({'特征名称': feature_names, '重要性得分': importances})
         feat_imp = feat_imp.sort_values('重要性得分', ascending=False).head(top_n)
 
@@ -1184,6 +1663,33 @@ def compute_policy_impact(policy_path, tokenizer, model):
     return total_policy_score, policy_post_mapping, df_policy["embedding"].tolist()
 
 
+def build_key_match_mask(employee_keys, policy_keys_list):
+    """构建员工-政策键匹配掩码，避免逐员工逐政策的 Python 级循环。"""
+    employee_count = len(employee_keys)
+    policy_count = len(policy_keys_list)
+    mask = np.zeros((employee_count, policy_count), dtype=bool)
+
+    key_to_rows = {}
+    for row_idx, key in enumerate(employee_keys):
+        cleaned_key = clean_text(key)
+        if cleaned_key:
+            key_to_rows.setdefault(cleaned_key, []).append(row_idx)
+
+    for col_idx, keys in enumerate(policy_keys_list):
+        if not keys:
+            continue
+        seen = set()
+        for key in keys:
+            cleaned_key = clean_text(key)
+            if not cleaned_key or cleaned_key in seen:
+                continue
+            seen.add(cleaned_key)
+            row_indices = key_to_rows.get(cleaned_key)
+            if row_indices:
+                mask[row_indices, col_idx] = True
+    return mask
+
+
 def add_policy_effect(df_emp, policy_df, tokenizer, model):
     """为员工添加政策识别和语义匹配特征"""
     df_emp = df_emp.copy()
@@ -1331,17 +1837,20 @@ def add_policy_effect(df_emp, policy_df, tokenizer, model):
     policy_role_keys_list = [ensure_list(value) for value in policy_df["target_role_keys"]]
     policy_department_keys_list = [ensure_list(value) for value in policy_df["target_department_keys"]]
 
+    role_match_mask = build_key_match_mask(emp_role_keys, policy_role_keys_list)
+    department_match_mask = build_key_match_mask(emp_department_keys, policy_department_keys_list)
+
     role_bonus = np.ones_like(match_matrix)
     department_bonus = np.ones_like(match_matrix)
-    for col_idx, role_keys in enumerate(policy_role_keys_list):
-        if role_keys:
-            role_bonus[:, col_idx] = np.array([1.20 if emp_key and emp_key in role_keys else 0.88 for emp_key in emp_role_keys], dtype=float)
-    for col_idx, department_keys in enumerate(policy_department_keys_list):
-        if department_keys:
-            department_bonus[:, col_idx] = np.array(
-                [1.10 if emp_key and emp_key in department_keys else 0.93 for emp_key in emp_department_keys],
-                dtype=float
-            )
+
+    role_policy_mask = np.array([bool(keys) for keys in policy_role_keys_list], dtype=bool)
+    if role_policy_mask.any():
+        role_bonus[:, role_policy_mask] = np.where(role_match_mask[:, role_policy_mask], 1.20, 0.88)
+
+    department_policy_mask = np.array([bool(keys) for keys in policy_department_keys_list], dtype=bool)
+    if department_policy_mask.any():
+        department_bonus[:, department_policy_mask] = np.where(department_match_mask[:, department_policy_mask], 1.10, 0.93)
+
     match_matrix = np.clip(match_matrix * role_bonus * department_bonus, 0, None)
 
     top_k = min(3, match_matrix.shape[1])
@@ -1350,11 +1859,14 @@ def add_policy_effect(df_emp, policy_df, tokenizer, model):
     df_emp["policy_match_max"] = match_matrix.max(axis=1)
     df_emp["policy_match_top3_mean"] = sorted_scores[:, -top_k:].mean(axis=1) if top_k else 0.0
 
-    role_specific_scores = []
-    for row_idx, emp_role_key in enumerate(emp_role_keys):
-        role_mask = np.array([bool(role_keys) and emp_role_key in role_keys for role_keys in policy_role_keys_list], dtype=bool)
-        role_specific_scores.append(match_matrix[row_idx, role_mask].mean() if role_mask.any() else df_emp["policy_match_mean"].iloc[row_idx])
-    df_emp["policy_role_match_mean"] = role_specific_scores
+    role_match_counts = role_match_mask.sum(axis=1)
+    role_match_sums = (match_matrix * role_match_mask).sum(axis=1)
+    policy_match_mean_values = df_emp["policy_match_mean"].to_numpy(dtype=float)
+    df_emp["policy_role_match_mean"] = np.where(
+        role_match_counts > 0,
+        role_match_sums / (role_match_counts + 1e-8),
+        policy_match_mean_values,
+    )
 
     policy_sentiments = policy_df["policy_sentiment"].to_numpy(dtype=float)
     support_weights = np.clip(policy_sentiments, 0, None)
@@ -1534,6 +2046,113 @@ def evaluate_binary_probabilities(y_true, y_prob, threshold):
     }
 
 
+def safe_binary_auc(y_true, y_prob):
+    """安全计算二分类AUC；若单折仅含单一类别则返回NaN。"""
+    y_array = np.asarray(y_true)
+    if len(np.unique(y_array)) < 2:
+        return np.nan
+    try:
+        return float(roc_auc_score(y_array, np.asarray(y_prob, dtype=float)))
+    except Exception:
+        return np.nan
+
+
+def build_generalization_diagnostics(metrics, warn_auc_gap=None):
+    """区分训练集内乐观分数和真正的OOF/Test泛化差距。"""
+    threshold = GENERALIZATION_WARN_AUC_GAP if warn_auc_gap is None else float(warn_auc_gap)
+
+    def usable_auc(value):
+        parsed = safe_float(value)
+        if parsed is None or not np.isfinite(parsed):
+            return None
+        return parsed
+
+    train_auc = usable_auc(metrics.get("train_auc"))
+    valid_auc = usable_auc(metrics.get("valid_auc"))
+    test_auc = usable_auc(metrics.get("test_auc"))
+    diagnostics = {
+        "generalization_warning_gap_threshold": float(threshold),
+        "generalization_warning": "UNKNOWN",
+        "train_auc_interpretation": "in_sample_reference_only",
+        "train_oof_auc_gap": np.nan,
+        "train_test_auc_gap": np.nan,
+        "oof_test_auc_gap": np.nan,
+        "oof_test_auc_gap_abs": np.nan,
+    }
+
+    if train_auc is not None and valid_auc is not None:
+        diagnostics["train_oof_auc_gap"] = float(train_auc - valid_auc)
+    if train_auc is not None and test_auc is not None:
+        diagnostics["train_test_auc_gap"] = float(train_auc - test_auc)
+    if valid_auc is not None and test_auc is not None:
+        oof_test_gap = float(test_auc - valid_auc)
+        diagnostics["oof_test_auc_gap"] = oof_test_gap
+        diagnostics["oof_test_auc_gap_abs"] = abs(oof_test_gap)
+        diagnostics["generalization_warning"] = "WARN" if abs(oof_test_gap) > threshold else "OK"
+
+    return diagnostics
+
+
+def build_fold_metric_row(
+    fold_id,
+    stage,
+    model_name,
+    y_true,
+    y_prob,
+    threshold,
+    train_size,
+    valid_size,
+    threshold_strategy="fixed",
+    high_risk_share=np.nan,
+):
+    """构建单折指标记录，供导出和日志分析使用。"""
+    payload = evaluate_binary_probabilities(y_true, y_prob, threshold)
+    return {
+        "fold_id": int(fold_id),
+        "stage": stage,
+        "model_name": model_name,
+        "train_size": int(train_size),
+        "valid_size": int(valid_size),
+        "valid_positive_count": int(np.sum(np.asarray(y_true) == 1)),
+        "valid_positive_rate": float(np.mean(np.asarray(y_true) == 1)),
+        "auc": safe_binary_auc(y_true, y_prob),
+        "acc": float(payload["acc"]),
+        "precision": float(payload["precision"]),
+        "recall": float(payload["recall"]),
+        "f1": float(payload["f1"]),
+        "pred_positive_rate": float(payload["pred_positive_rate"]),
+        "threshold_strategy": threshold_strategy,
+        "threshold_value": float(np.mean(np.asarray(threshold, dtype=float))),
+        "high_risk_share": float(high_risk_share) if pd.notna(high_risk_share) else np.nan,
+    }
+
+
+def build_cv_summary_frame(fold_metrics_df):
+    """按阶段/模型汇总交叉验证折内指标，输出mean/std。"""
+    if fold_metrics_df is None or fold_metrics_df.empty:
+        return pd.DataFrame()
+
+    summary_rows = []
+    metric_cols = [
+        "auc", "acc", "precision", "recall", "f1",
+        "pred_positive_rate", "valid_positive_rate", "high_risk_share"
+    ]
+    grouped = fold_metrics_df.groupby(["stage", "model_name"], dropna=False)
+    for (stage, model_name), group_df in grouped:
+        row = {
+            "stage": stage,
+            "model_name": model_name,
+            "fold_count": int(len(group_df)),
+        }
+        for metric_col in metric_cols:
+            metric_series = pd.to_numeric(group_df[metric_col], errors="coerce")
+            row[f"{metric_col}_mean"] = float(metric_series.mean()) if metric_series.notna().any() else np.nan
+            row[f"{metric_col}_std"] = float(metric_series.std(ddof=0)) if metric_series.notna().any() else np.nan
+        summary_rows.append(row)
+
+    return pd.DataFrame(summary_rows)
+
+
 def build_risk_segment_labels(df):
     """基于员工画像构建高风险/常规分层，用于分层阈值策略"""
     if df is None or len(df) == 0:
@@ -1558,17 +2177,192 @@ def build_risk_segment_labels(df):
     if 'policy_net_support' in df.columns:
         score += (df['policy_net_support'].fillna(0).to_numpy(dtype=float) <= 0).astype(float)
 
-    labels = np.where(score >= 2.0, "high_risk", "standard")
-    high_share = float(np.mean(labels == "high_risk"))
-    if high_share < 0.15 or high_share > 0.60:
-        adaptive_cutoff = float(np.quantile(score, 0.65))
-        labels = np.where(score >= max(adaptive_cutoff, 1.0), "high_risk", "standard")
+    labels = np.full(len(score), "standard", dtype=object)
+    if float(np.nanmax(score)) <= float(np.nanmin(score)):
+        return labels, score
 
-    if len(np.unique(labels)) < 2:
-        median_score = float(np.median(score))
-        labels = np.where(score >= median_score, "high_risk", "standard")
+    target_share = float(np.clip(RISK_SEGMENT_TARGET_SHARE, 0.20, 0.35))
+    high_count = int(round(len(score) * target_share))
+    high_count = max(1, min(len(score) - 1, high_count))
+    high_positions = np.argsort(-score, kind="mergesort")[:high_count]
+    labels[high_positions] = "high_risk"
 
     return labels, score
+
+
+def target_pred_positive_rate(y_true) -> float:
+    """召回优先的大名单目标：默认生成约15%-25%的潜在流失名单。"""
+    actual_positive_rate = float(np.mean(y_true)) if len(y_true) else 0.0
+    return float(np.clip(
+        actual_positive_rate * PRED_POSITIVE_RATE_MULTIPLIER,
+        PRED_POSITIVE_RATE_MIN,
+        PRED_POSITIVE_RATE_MAX,
+    ))
+
+
+def parse_rate_list(raw_text, fallback_rates, min_rate=0.001, max_rate=0.80):
+    """解析可配置比例列表，保留有序去重后的合法比例。"""
+    raw = str(raw_text or "").strip()
+    values = re.split(r"[\s,;|]+", raw) if raw else []
+    parsed_rates = []
+    seen = set()
+    for value in values:
+        try:
+            rate = float(value)
+        except Exception:
+            continue
+        if rate > 1.0:
+            rate = rate / 100.0
+        rate = float(np.clip(rate, min_rate, max_rate))
+        key = round(rate, 6)
+        if key in seen:
+            continue
+        seen.add(key)
+        parsed_rates.append(rate)
+    if parsed_rates:
+        return parsed_rates
+    return [float(rate) for rate in fallback_rates]
+
+
+def get_topk_eval_rates():
+    """Top-K名单评估比例，可通过 HR_TOPK_EVAL_RATES 调整。"""
+    return parse_rate_list(TOPK_EVAL_RATES_TEXT, [0.05, 0.10, 0.15, 0.20], min_rate=0.001, max_rate=0.80)
+
+
+def normalize_business_share(value, default_value, min_rate=0.01, max_rate=0.50):
+    try:
+        parsed = float(value)
+    except Exception:
+        parsed = float(default_value)
+    if parsed > 1.0:
+        parsed = parsed / 100.0
+    return float(np.clip(parsed, min_rate, max_rate))
+
+
+def get_business_tier_shares(priority_share=None, watch_share=None):
+    """业务分层比例：重点干预层必须小于观察层总覆盖。"""
+    priority = normalize_business_share(
+        PRIORITY_INTERVENTION_SHARE if priority_share is None else priority_share,
+        0.08,
+        min_rate=0.01,
+        max_rate=0.30,
+    )
+    watch = normalize_business_share(
+        WATCHLIST_SHARE if watch_share is None else watch_share,
+        0.20,
+        min_rate=0.02,
+        max_rate=0.60,
+    )
+    if watch <= priority:
+        watch = min(0.60, priority + 0.05)
+    return priority, watch
+
+
+def top_share_count(row_count, share):
+    if row_count <= 0:
+        return 0
+    return max(1, min(row_count, int(np.ceil(row_count * float(share)))))
+
+
+def build_topk_metrics_frame(y_true, y_prob, rates=None, config_source="HR_TOPK_EVAL_RATES"):
+    """按风险概率Top比例输出Precision/Recall/Lift，服务HR资源容量决策。"""
+    y_array = np.asarray(y_true, dtype=int)
+    prob_array = np.asarray(y_prob, dtype=float)
+    row_count = len(prob_array)
+    if row_count == 0:
+        return pd.DataFrame()
+
+    resolved_rates = rates if rates is not None else get_topk_eval_rates()
+    resolved_rates = parse_rate_list(",".join(str(rate) for rate in resolved_rates), [0.05, 0.10, 0.15, 0.20])
+    order = np.argsort(-prob_array, kind="mergesort")
+    positive_total = int(np.sum(y_array == 1))
+    base_positive_rate = float(positive_total / row_count) if row_count else 0.0
+    rows = []
+    for rate in resolved_rates:
+        list_size = top_share_count(row_count, rate)
+        selected_idx = order[:list_size]
+        hit_count = int(np.sum(y_array[selected_idx] == 1))
+        precision = float(hit_count / list_size) if list_size else np.nan
+        recall = float(hit_count / positive_total) if positive_total else np.nan
+        lift = float(precision / base_positive_rate) if base_positive_rate > 0 else np.nan
+        cutoff = float(np.min(prob_array[selected_idx])) if len(selected_idx) else np.nan
+        rows.append({
+            "名单比例": float(rate),
+            "名单比例说明": f"Top {rate:.0%}",
+            "名单人数": int(list_size),
+            "真实流失人数": int(positive_total),
+            "命中真实流失人数": int(hit_count),
+            "Precision": precision,
+            "Recall": recall,
+            "Lift": lift,
+            "基准流失率": base_positive_rate,
+            "概率截断点": cutoff,
+            "配置来源": config_source,
+        })
+    return pd.DataFrame(rows)
+
+
+def apply_business_tiers(detail_df, priority_share=None, watch_share=None, prob_col="流失概率"):
+    """按流失概率排名拆分为高优先级干预、观察名单、常规关注。"""
+    tiered_df = detail_df.copy()
+    if tiered_df.empty:
+        empty_config = {
+            "priority_share": 0.0,
+            "watch_share": 0.0,
+            "priority_count": 0,
+            "watch_count": 0,
+            "priority_threshold": np.nan,
+            "watch_threshold": np.nan,
+            "threshold_basis": "无可用预测样本",
+        }
+        return tiered_df, pd.DataFrame(), empty_config
+
+    priority, watch = get_business_tier_shares(priority_share, watch_share)
+    row_count = len(tiered_df)
+    priority_count = top_share_count(row_count, priority)
+    watch_count = max(priority_count, top_share_count(row_count, watch))
+    prob_values = pd.to_numeric(tiered_df[prob_col], errors="coerce").fillna(-np.inf).to_numpy(dtype=float)
+    order = np.argsort(-prob_values, kind="mergesort")
+    priority_idx = order[:priority_count]
+    watch_idx = order[priority_count:watch_count]
+    priority_threshold = float(np.min(prob_values[priority_idx])) if len(priority_idx) else np.nan
+    watch_threshold = float(np.min(prob_values[order[:watch_count]])) if watch_count else np.nan
+
+    tiers = np.full(row_count, "常规关注", dtype=object)
+    tiers[priority_idx] = "高优先级干预"
+    tiers[watch_idx] = "观察名单"
+    ranks = np.empty(row_count, dtype=int)
+    ranks[order] = np.arange(1, row_count + 1)
+
+    tiered_df["风险排名"] = ranks
+    tiered_df["风险排名百分位"] = ranks / row_count
+    tiered_df["名单层级"] = tiers
+    tiered_df["名单层级依据"] = (
+        f"按流失概率降序Top比例自动确定：高优先级Top {priority:.1%}，观察名单累计Top {watch:.1%}"
+    )
+
+    summary_rows = []
+    for tier_name in ["高优先级干预", "观察名单", "常规关注"]:
+        tier_mask = tiered_df["名单层级"] == tier_name
+        tier_probs = pd.to_numeric(tiered_df.loc[tier_mask, prob_col], errors="coerce")
+        summary_rows.append({
+            "名单层级": tier_name,
+            "人数": int(tier_mask.sum()),
+            "占比": float(tier_mask.mean()),
+            "最高流失概率": float(tier_probs.max()) if not tier_probs.empty else np.nan,
+            "最低流失概率": float(tier_probs.min()) if not tier_probs.empty else np.nan,
+            "分层依据": tiered_df["名单层级依据"].iloc[0],
+        })
+    config = {
+        "priority_share": float(priority),
+        "watch_share": float(watch),
+        "priority_count": int(priority_count),
+        "watch_count": int(watch_count),
+        "priority_threshold": priority_threshold,
+        "watch_threshold": watch_threshold,
+        "threshold_basis": tiered_df["名单层级依据"].iloc[0],
+    }
+    return tiered_df, pd.DataFrame(summary_rows), config
 
 
 def resolve_threshold_array(y_prob, threshold_config, df_context=None):
@@ -1585,7 +2379,7 @@ def resolve_threshold_array(y_prob, threshold_config, df_context=None):
 
 
 def optimize_segment_thresholds(y_true, y_prob, df_context, base_threshold):
-    """在高风险组/常规组上分别搜索阈值，优先提升整体F1"""
+    """在高风险组/常规组上分别搜索阈值，控制业务名单规模。"""
     segment_labels, segment_score = build_risk_segment_labels(df_context)
     if len(segment_labels) == 0:
         payload = evaluate_binary_probabilities(y_true, y_prob, base_threshold)
@@ -1612,9 +2406,12 @@ def optimize_segment_thresholds(y_true, y_prob, df_context, base_threshold):
             "global_threshold": float(base_threshold)
         }, payload
 
+    target_rate = target_pred_positive_rate(y_true)
+    min_rate = max(PRED_POSITIVE_RATE_MIN * 0.75, target_rate - 0.04)
+    max_rate = min(PRED_POSITIVE_RATE_MAX, target_rate + 0.04)
     best_result = None
-    high_candidates = np.arange(max(0.20, base_threshold - 0.18), min(0.75, base_threshold + 0.02) + 0.0001, 0.02)
-    standard_candidates = np.arange(max(0.35, base_threshold - 0.02), min(0.90, base_threshold + 0.16) + 0.0001, 0.02)
+    high_candidates = np.arange(max(0.35, base_threshold - 0.08), 0.9501, 0.02)
+    standard_candidates = np.arange(max(0.45, base_threshold), 0.9801, 0.02)
 
     for high_threshold in high_candidates:
         for standard_threshold in standard_candidates:
@@ -1623,15 +2420,31 @@ def optimize_segment_thresholds(y_true, y_prob, df_context, base_threshold):
             threshold_array = np.where(high_mask, high_threshold, standard_threshold).astype(float)
             payload = evaluate_binary_probabilities(y_true, y_prob, threshold_array)
             threshold_gap = standard_threshold - high_threshold
+            pred_rate = float(payload["pred_positive_rate"])
+            rate_gap = abs(pred_rate - target_rate)
+            over_limit = max(pred_rate - max_rate, 0.0)
+            under_limit = max(min_rate - pred_rate, 0.0)
+            business_sized = min_rate <= pred_rate <= max_rate
             score = (
-                0.64 * payload["f1"]
+                0.34 * payload["f1"]
+                + 0.28 * payload["precision"]
                 + 0.18 * payload["recall"]
-                + 0.10 * payload["acc"]
-                + 0.08 * payload["precision"]
-                - 0.03 * abs(payload["pred_positive_rate"] - float(np.mean(y_true)))
-                - 0.02 * max(threshold_gap - 0.18, 0.0)
+                + 0.12 * payload["acc"]
+                - 1.25 * rate_gap
+                - 2.50 * over_limit
+                - 0.70 * under_limit
+                - 0.02 * max(threshold_gap - 0.22, 0.0)
             )
-            if best_result is None or score > best_result["score"] + 1e-12:
+            if (
+                best_result is None
+                or (business_sized and not best_result["business_sized"])
+                or (business_sized == best_result["business_sized"] and score > best_result["score"] + 1e-12)
+                or (
+                    business_sized == best_result["business_sized"]
+                    and abs(score - best_result["score"]) <= 1e-12
+                    and payload["precision"] > best_result["payload"]["precision"] + 1e-12
+                )
+            ):
                 best_result = {
                     "threshold_config": {
                         "type": "segment",
@@ -1639,11 +2452,15 @@ def optimize_segment_thresholds(y_true, y_prob, df_context, base_threshold):
                         "high_risk": float(high_threshold),
                         "standard": float(standard_threshold),
                         "high_risk_share": float(np.mean(high_mask)),
+                        "target_pred_positive_rate": float(target_rate),
+                        "min_pred_positive_rate": float(min_rate),
+                        "max_pred_positive_rate": float(max_rate),
                         "high_risk_score_mean": float(np.mean(segment_score[high_mask])) if high_mask.any() else 0.0,
                         "standard_score_mean": float(np.mean(segment_score[standard_mask])) if standard_mask.any() else 0.0
                     },
                     "payload": payload,
-                    "score": score
+                    "score": score,
+                    "business_sized": business_sized,
                 }
 
     if best_result is None:
@@ -1657,14 +2474,15 @@ def optimize_segment_thresholds(y_true, y_prob, df_context, base_threshold):
     return best_result["threshold_config"], best_result["payload"]
 
 
-def fit_probability_calibrator(y_true, y_prob):
+def fit_probability_calibrator(y_true, y_prob, random_state=RANDOM_STATE):
     """基于OOF概率做一维Platt校准，提升阈值迁移稳定性"""
     clipped_prob = np.clip(np.asarray(y_prob, dtype=float), 1e-6, 1 - 1e-6)
     logit_feature = np.log(clipped_prob / (1.0 - clipped_prob)).reshape(-1, 1)
+    resolved_seed = normalize_random_state(random_state)
     calibrator = LogisticRegression(
         solver='lbfgs',
         C=1.0,
-        random_state=RANDOM_STATE
+        random_state=resolved_seed
     )
     calibrator.fit(logit_feature, np.asarray(y_true))
     return calibrator
@@ -1681,8 +2499,9 @@ def apply_probability_calibrator(calibrator, y_prob):
 
 def optimize_classification_threshold(y_true, y_prob):
     """在验证集上寻找更稳健的最佳阈值，避免过度保守压低召回"""
-    actual_positive_rate = float(np.mean(y_true))
-    target_positive_rate = float(np.clip(actual_positive_rate * 1.10, 0.12, 0.30))
+    target_positive_rate = target_pred_positive_rate(y_true)
+    min_positive_rate = max(PRED_POSITIVE_RATE_MIN * 0.75, target_positive_rate - 0.04)
+    max_positive_rate = min(PRED_POSITIVE_RATE_MAX, target_positive_rate + 0.04)
 
     def evaluate_thresholds(thresholds, current_best_threshold=0.5, current_best_payload=None):
         best_threshold_local = current_best_threshold
@@ -1700,13 +2519,16 @@ def optimize_classification_threshold(y_true, y_prob):
         for threshold in thresholds:
             payload = evaluate_binary_probabilities(y_true, y_prob, threshold)
             rate_gap = abs(payload["pred_positive_rate"] - target_positive_rate)
+            over_limit = max(payload["pred_positive_rate"] - max_positive_rate, 0.0)
+            under_limit = max(min_positive_rate - payload["pred_positive_rate"], 0.0)
             score = (
-                0.56 * payload["f1"]
-                + 0.22 * payload["recall"]
+                0.38 * payload["f1"]
+                + 0.24 * payload["precision"]
+                + 0.18 * payload["recall"]
                 + 0.12 * payload["acc"]
-                + 0.10 * payload["precision"]
-                - 0.10 * rate_gap
-                - 0.04 * max(float(threshold) - 0.62, 0.0)
+                - 1.00 * rate_gap
+                - 2.00 * over_limit
+                - 0.60 * under_limit
             )
             if (
                 score > best_payload_local["score"] + 1e-12
@@ -1729,35 +2551,26 @@ def optimize_classification_threshold(y_true, y_prob):
 
     prevalence_threshold = float(np.quantile(y_prob, 1.0 - target_positive_rate))
     coarse_thresholds = np.unique(np.concatenate([
-        np.arange(0.25, 0.701, 0.02),
-        np.array([prevalence_threshold, 0.50, 0.55, 0.60])
+        np.arange(0.25, 0.901, 0.02),
+        np.array([prevalence_threshold, 0.50, 0.55, 0.60, 0.70, 0.80])
     ]))
     best_threshold, best_payload = evaluate_thresholds(coarse_thresholds)
     fine_start = max(0.10, best_threshold - 0.05)
-    fine_end = min(0.75, best_threshold + 0.05)
+    fine_end = min(0.95, best_threshold + 0.05)
     fine_thresholds = np.arange(fine_start, fine_end + 0.0001, 0.005)
     best_threshold, best_payload = evaluate_thresholds(fine_thresholds, best_threshold, best_payload)
     return best_threshold, best_payload
 
 
-def lgb_random_search(X_train_trans, y_train, n_iter=16, random_state=RANDOM_STATE):
+def lgb_random_search(X_train_trans, y_train, n_iter=16, random_state=RANDOM_STATE, cv_random_state=None):
     """LightGBM随机搜索调参"""
     ensure_lightgbm()
+    random_state = normalize_random_state(random_state)
+    cv_random_state = normalize_random_state(random_state if cv_random_state is None else cv_random_state)
     scale_pos_weight = compute_scale_pos_weight(y_train)
 
     # 超参数搜索空间
-    param_dist = {
-        'num_leaves': [7, 15, 31],
-        'learning_rate': [0.02, 0.03, 0.05],
-        'n_estimators': [120, 180, 240, 320],
-        'max_depth': [2, 3, 4],
-        'min_child_samples': [35, 50, 70, 90],
-        'subsample': [0.65, 0.75, 0.85],
-        'colsample_bytree': [0.6, 0.7, 0.8],
-        'reg_alpha': [0.5, 1.0, 2.0, 4.0],
-        'reg_lambda': [1.0, 2.0, 4.0, 6.0],
-        'min_split_gain': [0.0, 0.1, 0.2, 0.4]
-    }
+    param_dist = dict(LGB_REGULARIZED_PARAM_DIST)
 
     # 初始化模型与搜索
     clf = lgb.LGBMClassifier(
@@ -1766,14 +2579,14 @@ def lgb_random_search(X_train_trans, y_train, n_iter=16, random_state=RANDOM_STA
         n_jobs=1,
         scale_pos_weight=scale_pos_weight
     )
-    cv = StratifiedKFold(n_splits=4, shuffle=True, random_state=random_state)
+    cv = StratifiedKFold(n_splits=4, shuffle=True, random_state=cv_random_state)
     rs = RandomizedSearchCV(
         clf,
         param_distributions=param_dist,
         n_iter=n_iter,
         scoring='roc_auc',
         cv=cv,
-        n_jobs=-1,
+        n_jobs=MODEL_PARALLEL_N_JOBS,
         random_state=random_state,
         verbose=0
     )
@@ -1783,8 +2596,98 @@ def lgb_random_search(X_train_trans, y_train, n_iter=16, random_state=RANDOM_STA
     return rs.best_estimator_
 
 
-def build_base_models(best_lgb_params, scale_pos_weight):
+def refine_lgb_params_with_early_stopping(
+    X_train_trans,
+    y_train,
+    best_lgb_params,
+    random_state=RANDOM_STATE,
+    split_random_state=None,
+    valid_size=LGB_EARLY_STOPPING_VALID_SIZE,
+    early_stopping_rounds=LGB_EARLY_STOPPING_ROUNDS,
+):
+    """基于独立验证切片做LightGBM早停细化，降低小样本场景过拟合风险。"""
+    ensure_lightgbm()
+    resolved_seed = normalize_random_state(random_state)
+    resolved_split_seed = normalize_random_state(resolved_seed if split_random_state is None else split_random_state)
+    y_array = np.asarray(y_train)
+    refined_params = dict(best_lgb_params)
+
+    if len(y_array) < 100 or len(np.unique(y_array)) < 2:
+        return refined_params, {
+            "enabled": False,
+            "best_iteration": refined_params.get("n_estimators"),
+            "valid_auc": np.nan,
+            "valid_size": 0.0,
+            "reason": "insufficient_samples",
+        }
+
+    X_fit, X_valid, y_fit, y_valid = train_test_split(
+        X_train_trans,
+        y_array,
+        test_size=valid_size,
+        stratify=y_array,
+        random_state=resolved_split_seed,
+    )
+
+    fit_scale_pos_weight = compute_scale_pos_weight(y_fit)
+    lgb_param_keys = [
+        "num_leaves", "learning_rate", "n_estimators", "max_depth",
+        "min_child_samples", "subsample", "colsample_bytree",
+        "reg_alpha", "reg_lambda", "min_split_gain"
+    ]
+    early_stop_params = {
+        "objective": "binary",
+        "random_state": resolved_seed,
+        "n_jobs": MODEL_PARALLEL_N_JOBS,
+        "scale_pos_weight": fit_scale_pos_weight,
+    }
+    for key in lgb_param_keys:
+        if key in refined_params:
+            early_stop_params[key] = refined_params[key]
+
+    early_stop_model = lgb.LGBMClassifier(**early_stop_params)
+    callbacks = [
+        lgb.early_stopping(stopping_rounds=early_stopping_rounds, verbose=False),
+        lgb.log_evaluation(period=0),
+    ]
+    try:
+        early_stop_model.fit(
+            X_fit,
+            y_fit,
+            eval_set=[(X_valid, y_valid)],
+            eval_metric="auc",
+            callbacks=callbacks,
+        )
+        best_iteration = getattr(early_stop_model, "best_iteration_", None)
+        if best_iteration is None:
+            booster = getattr(early_stop_model, "booster_", None)
+            best_iteration = getattr(booster, "best_iteration", None)
+        if best_iteration is not None:
+            refined_params["n_estimators"] = int(max(50, best_iteration))
+
+        valid_prob = early_stop_model.predict_proba(X_valid)[:, 1]
+        valid_auc = safe_binary_auc(y_valid, valid_prob)
+        return refined_params, {
+            "enabled": True,
+            "best_iteration": int(refined_params.get("n_estimators", best_lgb_params.get("n_estimators", 0))),
+            "valid_auc": valid_auc,
+            "valid_size": float(valid_size),
+            "reason": "ok",
+        }
+    except Exception as exc:
+        logging.warning("⚠️ LightGBM早停细化失败，回退随机搜索最佳参数：%s", exc)
+        return dict(best_lgb_params), {
+            "enabled": False,
+            "best_iteration": best_lgb_params.get("n_estimators"),
+            "valid_auc": np.nan,
+            "valid_size": float(valid_size),
+            "reason": f"fallback:{exc}",
+        }
+
+
+def build_base_models(best_lgb_params, scale_pos_weight, random_state=RANDOM_STATE):
     """构建基础模型：更保守的LightGBM + 平衡LR + ExtraTrees"""
+    resolved_seed = normalize_random_state(random_state)
     lgb_param_keys = [
         "num_leaves", "learning_rate", "n_estimators", "max_depth",
         "min_child_samples", "subsample", "colsample_bytree",
@@ -1792,7 +2695,7 @@ def build_base_models(best_lgb_params, scale_pos_weight):
     ]
     lgb_params = {
         "objective": "binary",
-        "random_state": RANDOM_STATE,
+        "random_state": resolved_seed,
         "n_jobs": -1,
         "scale_pos_weight": scale_pos_weight
     }
@@ -1806,17 +2709,19 @@ def build_base_models(best_lgb_params, scale_pos_weight):
         solver='liblinear',
         class_weight='balanced',
         C=0.35,
-        random_state=RANDOM_STATE
+        random_state=resolved_seed
     )
     et_clf = ExtraTreesClassifier(
-        n_estimators=400,
-        max_depth=7,
-        min_samples_split=12,
-        min_samples_leaf=5,
-        max_features='sqrt',
+        n_estimators=ET_REGULARIZED_PARAMS["n_estimators"],
+        max_depth=ET_REGULARIZED_PARAMS["max_depth"],
+        min_samples_split=ET_REGULARIZED_PARAMS["min_samples_split"],
+        min_samples_leaf=ET_REGULARIZED_PARAMS["min_samples_leaf"],
+        max_features=ET_REGULARIZED_PARAMS["max_features"],
+        bootstrap=ET_REGULARIZED_PARAMS["bootstrap"],
+        oob_score=ET_REGULARIZED_PARAMS["oob_score"],
         class_weight='balanced_subsample',
-        random_state=RANDOM_STATE,
-        n_jobs=-1
+        random_state=resolved_seed,
+        n_jobs=MODEL_PARALLEL_N_JOBS
     )
     return {"lgb": lgb_clf, "lr": lr_clf, "et": et_clf}
 
@@ -1846,8 +2751,9 @@ def build_meta_feature_matrix(prob_map, weight_map):
     ])
 
 
-def build_meta_learner():
+def build_meta_learner(random_state=RANDOM_STATE):
     """构建轻量二层融合器，避免固定权重在测试集迁移失真"""
+    resolved_seed = normalize_random_state(random_state)
     return Pipeline([
         ("scaler", StandardScaler()),
         ("lr", LogisticRegression(
@@ -1855,25 +2761,44 @@ def build_meta_learner():
             solver='lbfgs',
             C=0.35,
             class_weight='balanced',
-            random_state=RANDOM_STATE
+            random_state=resolved_seed
         ))
     ])
 
 
-def fit_meta_learner_with_oof(meta_X, y, n_splits=5):
+def fit_meta_learner_with_oof(meta_X, y, n_splits=5, random_state=RANDOM_STATE, cv_random_state=None):
     """基于OOF二层特征训练轻量元模型，并返回元模型OOF预测"""
+    resolved_seed = normalize_random_state(random_state)
+    resolved_cv_seed = normalize_random_state(resolved_seed if cv_random_state is None else cv_random_state)
     y_array = np.asarray(y)
     meta_oof_prob = np.zeros(len(y_array), dtype=float)
-    cv = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=RANDOM_STATE)
+    fold_assignments = np.zeros(len(y_array), dtype=int)
+    fold_metric_rows = []
+    cv = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=resolved_cv_seed)
 
-    for train_idx, valid_idx in cv.split(meta_X, y_array):
-        meta_model_fold = build_meta_learner()
+    for fold_id, (train_idx, valid_idx) in enumerate(cv.split(meta_X, y_array), start=1):
+        meta_model_fold = build_meta_learner(random_state=resolved_seed)
         meta_model_fold.fit(meta_X[train_idx], y_array[train_idx])
-        meta_oof_prob[valid_idx] = meta_model_fold.predict_proba(meta_X[valid_idx])[:, 1]
+        valid_prob = meta_model_fold.predict_proba(meta_X[valid_idx])[:, 1]
+        meta_oof_prob[valid_idx] = valid_prob
+        fold_assignments[valid_idx] = fold_id
+        fold_metric_rows.append(
+            build_fold_metric_row(
+                fold_id=fold_id,
+                stage="meta_oof_raw",
+                model_name="meta_learner",
+                y_true=y_array[valid_idx],
+                y_prob=valid_prob,
+                threshold=0.5,
+                train_size=len(train_idx),
+                valid_size=len(valid_idx),
+                threshold_strategy="fixed_0.50",
+            )
+        )
 
-    final_meta_model = build_meta_learner()
+    final_meta_model = build_meta_learner(random_state=resolved_seed)
     final_meta_model.fit(meta_X, y_array)
-    return meta_oof_prob, final_meta_model
+    return meta_oof_prob, final_meta_model, pd.DataFrame(fold_metric_rows), fold_assignments
 
 
 class BlendedAttritionModel:
@@ -1908,26 +2833,110 @@ class BlendedAttritionModel:
         return (self.predict_proba(X)[:, 1] >= threshold).astype(int)
 
 
-def generate_oof_predictions(X, y, best_lgb_params, n_splits=5):
+class MultiSeedEnsembleModel:
+    """多seed概率平均集成器，保持与单模型推理接口兼容。"""
+    def __init__(self, seed_models, seed_list):
+        self.seed_models = list(seed_models or [])
+        self.seed_list = [int(seed) for seed in seed_list or []]
+        self.seed_model_count = len(self.seed_models)
+        self.representative_model = self.seed_models[0] if self.seed_models else None
+        self.named_estimators_ = (
+            self.representative_model.named_estimators_
+            if self.representative_model is not None and hasattr(self.representative_model, "named_estimators_")
+            else {}
+        )
+
+    def predict_proba(self, X):
+        if not self.seed_models:
+            raise RuntimeError("MultiSeedEnsembleModel has no fitted seed models.")
+        seed_prob_matrix = np.column_stack([
+            seed_model.predict_proba(X)[:, 1]
+            for seed_model in self.seed_models
+        ])
+        mean_prob = seed_prob_matrix.mean(axis=1)
+        return np.column_stack([1 - mean_prob, mean_prob])
+
+    def predict(self, X, threshold=0.5):
+        return (self.predict_proba(X)[:, 1] >= threshold).astype(int)
+
+
+def get_seed_model_list(model):
+    """统一获取单模型/多seed模型列表。"""
+    if hasattr(model, "seed_models") and getattr(model, "seed_models"):
+        return list(model.seed_models)
+    return [model]
+
+
+def get_reference_lgb_model(model):
+    """为SHAP等解释任务选择代表性LightGBM子模型。"""
+    for seed_model in get_seed_model_list(model):
+        named_estimators = getattr(seed_model, "named_estimators_", {}) or {}
+        lgb_model = named_estimators.get("lgb")
+        if lgb_model is not None:
+            return lgb_model
+    return None
+
+
+def get_aggregated_lgb_importances(model):
+    """聚合多seed中的LightGBM重要性；单模型时退化为原始重要性。"""
+    importance_list = []
+    for seed_model in get_seed_model_list(model):
+        lgb_model = get_reference_lgb_model(seed_model)
+        if lgb_model is None or not hasattr(lgb_model, "feature_importances_"):
+            continue
+        importance_list.append(np.asarray(lgb_model.feature_importances_, dtype=float))
+
+    if not importance_list:
+        return None
+    if len(importance_list) == 1:
+        return importance_list[0]
+    return np.mean(np.vstack(importance_list), axis=0)
+
+
+def generate_oof_predictions(X, y, best_lgb_params, n_splits=5, random_state=RANDOM_STATE, cv_random_state=None):
     """生成多个基础模型的OOF预测，用于稳健融合与阈值优化"""
+    resolved_seed = normalize_random_state(random_state)
+    resolved_cv_seed = normalize_random_state(resolved_seed if cv_random_state is None else cv_random_state)
     y_array = np.asarray(y)
     oof_pred_map = {
         "lgb": np.zeros(len(y_array)),
         "lr": np.zeros(len(y_array)),
         "et": np.zeros(len(y_array))
     }
-    cv = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=RANDOM_STATE)
+    fold_assignments = np.zeros(len(y_array), dtype=int)
+    fold_metric_rows = []
+    cv = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=resolved_cv_seed)
 
-    for train_idx, valid_idx in cv.split(X, y_array):
+    for fold_id, (train_idx, valid_idx) in enumerate(cv.split(X, y_array), start=1):
         X_train_fold, X_valid_fold = X[train_idx], X[valid_idx]
         y_train_fold = y_array[train_idx]
+        y_valid_fold = y_array[valid_idx]
+        fold_assignments[valid_idx] = fold_id
 
-        model_map = build_base_models(best_lgb_params, compute_scale_pos_weight(y_train_fold))
+        model_map = build_base_models(
+            best_lgb_params,
+            compute_scale_pos_weight(y_train_fold),
+            random_state=resolved_seed,
+        )
         for name, model in model_map.items():
             model.fit(X_train_fold, y_train_fold)
-            oof_pred_map[name][valid_idx] = model.predict_proba(X_valid_fold)[:, 1]
+            valid_prob = model.predict_proba(X_valid_fold)[:, 1]
+            oof_pred_map[name][valid_idx] = valid_prob
+            fold_metric_rows.append(
+                build_fold_metric_row(
+                    fold_id=fold_id,
+                    stage="base_oof",
+                    model_name=name,
+                    y_true=y_valid_fold,
+                    y_prob=valid_prob,
+                    threshold=0.5,
+                    train_size=len(train_idx),
+                    valid_size=len(valid_idx),
+                    threshold_strategy="fixed_0.50",
+                )
+            )
 
-    return oof_pred_map
+    return oof_pred_map, pd.DataFrame(fold_metric_rows), fold_assignments
 
 
 def optimize_blend_and_threshold(y_true, prob_map):
@@ -2003,13 +3012,28 @@ def optimize_blend_and_threshold(y_true, prob_map):
 # -----------------------
 # 融合模型训练（LightGBM+逻辑回归+ExtraTrees）
 # -----------------------
-def train_stacking_lgb(X_df, y, preprocessor):
+def train_stacking_lgb(
+    X_df,
+    y,
+    preprocessor,
+    random_state=RANDOM_STATE,
+    run_label="primary",
+    fixed_split=None,
+    split_random_state=RANDOM_STATE,
+    cv_random_state=None,
+):
     """训练调参与OOF融合优化后的集成模型（使用全量增强特征）"""
     ensure_lightgbm()
+    resolved_seed = normalize_random_state(random_state)
+    resolved_split_seed = normalize_random_state(split_random_state)
+    resolved_cv_seed = normalize_random_state(resolved_seed if cv_random_state is None else cv_random_state)
     # 划分训练池与测试集
-    X_train_valid_df, X_test_df, y_train_valid, y_test = train_test_split(
-        X_df, y, test_size=TEST_SIZE, stratify=y, random_state=RANDOM_STATE
-    )
+    if fixed_split is None:
+        X_train_valid_df, X_test_df, y_train_valid, y_test = train_test_split(
+            X_df, y, test_size=TEST_SIZE, stratify=y, random_state=resolved_split_seed
+        )
+    else:
+        X_train_valid_df, X_test_df, y_train_valid, y_test = fixed_split
     y_train_valid_array = np.asarray(y_train_valid)
 
     # 1. 使用全量增强特征，避免激进筛选带来的泛化损失
@@ -2022,18 +3046,42 @@ def train_stacking_lgb(X_df, y, preprocessor):
     X_test_trans = preprocessor.transform(X_test_df)
 
     # 2. 在增强后的全量特征空间中调参与融合
-    best_lgb = lgb_random_search(X_train_valid_trans, y_train_valid_array)
+    best_lgb = lgb_random_search(
+        X_train_valid_trans,
+        y_train_valid_array,
+        random_state=resolved_seed,
+        cv_random_state=resolved_cv_seed,
+    )
     best_lgb_params = best_lgb.get_params()
+    best_lgb_params, lgb_early_stop_info = refine_lgb_params_with_early_stopping(
+        X_train_valid_trans,
+        y_train_valid_array,
+        best_lgb_params,
+        random_state=resolved_seed,
+        split_random_state=resolved_split_seed,
+    )
 
     # 3. 生成OOF预测，寻找最佳融合权重和阈值
-    oof_pred_map = generate_oof_predictions(X_train_valid_trans, y_train_valid_array, best_lgb_params)
+    oof_pred_map, base_fold_metrics_df, _ = generate_oof_predictions(
+        X_train_valid_trans,
+        y_train_valid_array,
+        best_lgb_params,
+        random_state=resolved_seed,
+        cv_random_state=resolved_cv_seed,
+    )
     best_weight_map, _, _ = optimize_blend_and_threshold(y_train_valid_array, oof_pred_map)
     meta_oof_X = build_meta_feature_matrix(oof_pred_map, best_weight_map)
-    meta_oof_prob, meta_model = fit_meta_learner_with_oof(meta_oof_X, y_train_valid_array)
+    meta_oof_prob, meta_model, meta_raw_fold_metrics_df, meta_fold_assignments = fit_meta_learner_with_oof(
+        meta_oof_X,
+        y_train_valid_array,
+        random_state=resolved_seed,
+        cv_random_state=resolved_cv_seed,
+    )
     best_threshold, calibrated_oof_metrics = optimize_classification_threshold(y_train_valid_array, meta_oof_prob)
     threshold_strategy, segmented_oof_metrics = optimize_segment_thresholds(
         y_train_valid_array, meta_oof_prob, X_train_valid_df, best_threshold
     )
+    oof_threshold_array, oof_segment_labels = resolve_threshold_array(meta_oof_prob, threshold_strategy, X_train_valid_df)
     oof_metrics = {
         "auc": roc_auc_score(y_train_valid_array, meta_oof_prob),
         "acc": segmented_oof_metrics["acc"],
@@ -2043,8 +3091,76 @@ def train_stacking_lgb(X_df, y, preprocessor):
         "pred_positive_rate": segmented_oof_metrics["pred_positive_rate"]
     }
 
+    final_oof_fold_rows = []
+    unique_fold_ids = sorted([fold_id for fold_id in np.unique(meta_fold_assignments) if int(fold_id) > 0])
+    for fold_id in unique_fold_ids:
+        fold_mask = meta_fold_assignments == fold_id
+        fold_positions = np.where(fold_mask)[0]
+        fold_segment = oof_segment_labels[fold_mask] if oof_segment_labels is not None else None
+        final_oof_fold_rows.append(
+            build_fold_metric_row(
+                fold_id=fold_id,
+                stage="final_oof",
+                model_name="meta_learner",
+                y_true=y_train_valid_array[fold_mask],
+                y_prob=meta_oof_prob[fold_mask],
+                threshold=oof_threshold_array[fold_mask],
+                train_size=int(len(y_train_valid_array) - len(fold_positions)),
+                valid_size=len(fold_positions),
+                threshold_strategy=threshold_strategy.get("type", "global") if isinstance(threshold_strategy, dict) else "global",
+                high_risk_share=float(np.mean(fold_segment == "high_risk")) if fold_segment is not None and len(fold_segment) else np.nan,
+            )
+        )
+    final_oof_fold_metrics_df = pd.DataFrame(final_oof_fold_rows)
+
+    blended_oof_prob = (
+        best_weight_map["lgb"] * oof_pred_map["lgb"]
+        + best_weight_map["lr"] * oof_pred_map["lr"]
+        + best_weight_map["et"] * oof_pred_map["et"]
+    )
+    oof_detail_df = pd.DataFrame({
+        "source_row_index": np.asarray(X_train_valid_df.index),
+        "fold_id": meta_fold_assignments.astype(int),
+        "y_true": y_train_valid_array.astype(int),
+        "lgb_prob": np.asarray(oof_pred_map["lgb"], dtype=float),
+        "lr_prob": np.asarray(oof_pred_map["lr"], dtype=float),
+        "et_prob": np.asarray(oof_pred_map["et"], dtype=float),
+        "blended_prob": np.asarray(blended_oof_prob, dtype=float),
+        "mean_prob": np.asarray(meta_oof_X[:, 4], dtype=float),
+        "std_prob": np.asarray(meta_oof_X[:, 5], dtype=float),
+        "disagreement": np.asarray(meta_oof_X[:, 6], dtype=float),
+        "meta_oof_prob": np.asarray(meta_oof_prob, dtype=float),
+        "oof_threshold": np.asarray(oof_threshold_array, dtype=float),
+        "oof_pred_label": (np.asarray(meta_oof_prob, dtype=float) >= np.asarray(oof_threshold_array, dtype=float)).astype(int),
+    })
+    if "EmployeeNumber" in X_train_valid_df.columns:
+        oof_detail_df["EmployeeNumber"] = X_train_valid_df["EmployeeNumber"].to_numpy()
+    if "Department" in X_train_valid_df.columns:
+        oof_detail_df["Department"] = X_train_valid_df["Department"].astype(str).to_numpy()
+    if "JobRole" in X_train_valid_df.columns:
+        oof_detail_df["JobRole"] = X_train_valid_df["JobRole"].astype(str).to_numpy()
+    if oof_segment_labels is not None:
+        oof_detail_df["risk_segment"] = oof_segment_labels
+
+    all_fold_metrics_df = pd.concat(
+        [base_fold_metrics_df, meta_raw_fold_metrics_df, final_oof_fold_metrics_df],
+        ignore_index=True,
+        sort=False
+    )
+    cv_artifacts = {
+        "base_fold_metrics": base_fold_metrics_df,
+        "meta_raw_fold_metrics": meta_raw_fold_metrics_df,
+        "final_oof_fold_metrics": final_oof_fold_metrics_df,
+        "fold_summary": build_cv_summary_frame(all_fold_metrics_df),
+        "oof_detail": oof_detail_df,
+    }
+
     # 4. 用全部训练池重训最终基础模型
-    final_model_map = build_base_models(best_lgb_params, compute_scale_pos_weight(y_train_valid_array))
+    final_model_map = build_base_models(
+        best_lgb_params,
+        compute_scale_pos_weight(y_train_valid_array),
+        random_state=resolved_seed,
+    )
     for model in final_model_map.values():
         model.fit(X_train_valid_trans, y_train_valid_array)
     blended_model = BlendedAttritionModel(final_model_map, best_weight_map, calibrator=None, meta_model=meta_model)
@@ -2083,21 +3199,45 @@ def train_stacking_lgb(X_df, y, preprocessor):
         'ensemble_strategy': 'oof_logistic_stack',
         'feature_strategy': 'full_enhanced_features',
         'probability_calibration': 'none',
+        'random_state': resolved_seed,
+        'split_random_state': resolved_split_seed,
+        'cv_random_state': resolved_cv_seed,
+        'run_label': run_label,
+        'lgb_early_stopping_enabled': bool(lgb_early_stop_info.get("enabled", False)),
+        'lgb_early_stopping_best_iteration': int(lgb_early_stop_info.get("best_iteration", best_lgb_params.get("n_estimators", 0)) or 0),
+        'lgb_early_stopping_valid_auc': lgb_early_stop_info.get("valid_auc"),
+        'lgb_early_stopping_valid_size': lgb_early_stop_info.get("valid_size"),
+        'lgb_early_stopping_reason': lgb_early_stop_info.get("reason", ""),
         'threshold_strategy': threshold_strategy.get('type', 'global'),
         'best_threshold': float(threshold_strategy.get('base_threshold', best_threshold)),
         'high_risk_threshold': float(threshold_strategy.get('high_risk', threshold_strategy.get('global_threshold', best_threshold))),
         'standard_threshold': float(threshold_strategy.get('standard', threshold_strategy.get('global_threshold', best_threshold))),
+        'target_pred_positive_rate': float(threshold_strategy.get('target_pred_positive_rate', target_pred_positive_rate(y_train_valid_array))),
+        'min_pred_positive_rate': float(threshold_strategy.get('min_pred_positive_rate', PRED_POSITIVE_RATE_MIN)),
+        'max_pred_positive_rate': float(threshold_strategy.get('max_pred_positive_rate', PRED_POSITIVE_RATE_MAX)),
         'train_high_risk_share': float(np.mean(train_segment_labels == "high_risk")) if train_segment_labels is not None and len(train_segment_labels) else 0.0,
         'test_high_risk_share': float(np.mean(test_segment_labels == "high_risk")) if test_segment_labels is not None and len(test_segment_labels) else 0.0,
         'selected_num_features': len(selected_num_cols),
         'selected_cat_features': len(selected_cat_cols),
         'selected_total_features': len(selected_num_cols) + len(selected_cat_cols),
     }
+    metrics.update(build_generalization_diagnostics(metrics))
 
     logging.info("✅ 模型训练完成，评估结果：")
     logging.info(
-        "  - 使用增强原始特征：数值 %s 个 | 类别 %s 个 | 合计 %s 个",
+        "  - 运行标识：%s | 随机种子：%s | 使用增强原始特征：数值 %s 个 | 类别 %s 个 | 合计 %s 个",
+        run_label, resolved_seed,
         metrics['selected_num_features'], metrics['selected_cat_features'], metrics['selected_total_features']
+    )
+    logging.info(
+        "  - 外层切分种子：%s | OOF/CV切分种子：%s",
+        resolved_split_seed, resolved_cv_seed
+    )
+    logging.info(
+        "  - LightGBM正则化搜索空间已收紧 | 早停启用：%s | 早停树数：%s | 早停验证AUC：%s",
+        metrics['lgb_early_stopping_enabled'],
+        metrics['lgb_early_stopping_best_iteration'],
+        f"{metrics['lgb_early_stopping_valid_auc']:.4f}" if pd.notna(metrics['lgb_early_stopping_valid_auc']) else "--",
     )
     logging.info(
         "  - OOF-AUC：%.4f | OOF-Acc：%.4f | OOF-F1：%.4f | 融合权重(LGB/LR/ET)=%.2f/%.2f/%.2f | 最优阈值：%.2f",
@@ -2107,14 +3247,36 @@ def train_stacking_lgb(X_df, y, preprocessor):
     logging.info("  - 集成策略：%s", metrics['ensemble_strategy'])
     logging.info("  - 概率校准方式：%s", metrics['probability_calibration'])
     logging.info(
-        "  - 阈值策略：%s | 高风险阈值：%.2f | 常规阈值：%.2f | 测试高风险组占比：%.4f",
-        metrics['threshold_strategy'], metrics['high_risk_threshold'], metrics['standard_threshold'], metrics['test_high_risk_share']
+        "  - 阈值策略：%s | 高风险阈值：%.2f | 常规阈值：%.2f | 目标名单率：%.4f | 允许区间：%.4f-%.4f | 测试高风险组占比：%.4f",
+        metrics['threshold_strategy'], metrics['high_risk_threshold'], metrics['standard_threshold'],
+        metrics['target_pred_positive_rate'], metrics['min_pred_positive_rate'], metrics['max_pred_positive_rate'],
+        metrics['test_high_risk_share']
     )
     logging.info(
         "  - OOF-Precision：%.4f | OOF-Recall：%.4f | OOF预测流失率：%.4f",
         metrics['valid_precision'], metrics['valid_recall'], metrics['valid_pred_positive_rate']
     )
-    logging.info("  - 训练AUC：%.4f | 测试AUC：%.4f", metrics['train_auc'], metrics['test_auc'])
+    if not final_oof_fold_metrics_df.empty:
+        logging.info("  - 5折最终OOF明细：")
+        for _, row in final_oof_fold_metrics_df.iterrows():
+            logging.info(
+                "    Fold %s | AUC：%.4f | Precision：%.4f | Recall：%.4f | F1：%.4f | 预测流失率：%.4f",
+                int(row["fold_id"]),
+                float(row["auc"]) if pd.notna(row["auc"]) else float("nan"),
+                float(row["precision"]),
+                float(row["recall"]),
+                float(row["f1"]),
+                float(row["pred_positive_rate"]),
+            )
+    logging.info(
+        "  - 训练内样本AUC(仅参考)：%.4f | OOF-AUC：%.4f | 测试AUC：%.4f | OOF/Test差值：%+.4f",
+        metrics['train_auc'], metrics['valid_auc'], metrics['test_auc'], metrics['oof_test_auc_gap']
+    )
+    logging.info(
+        "  - 泛化诊断：%s | 训练/OOF乐观差：%+.4f | 预警阈值：%.2f",
+        metrics['generalization_warning'], metrics.get('train_oof_auc_gap', float("nan")),
+        metrics['generalization_warning_gap_threshold']
+    )
     logging.info("  - 训练Acc：%.4f | 测试Acc：%.4f", metrics['train_acc'], metrics['test_acc'])
     logging.info(
         "  - 训练Precision：%.4f | 测试Precision：%.4f",
@@ -2126,7 +3288,323 @@ def train_stacking_lgb(X_df, y, preprocessor):
     )
     logging.info("  - 训练F1：%.4f | 测试F1：%.4f", metrics['train_f1'], metrics['test_f1'])
 
-    return blended_model, preprocessor, X_train_valid_df, X_test_df, y_train_valid, y_test, metrics, threshold_strategy
+    return blended_model, preprocessor, X_train_valid_df, X_test_df, y_train_valid, y_test, metrics, threshold_strategy, cv_artifacts
+
+
+def build_multi_seed_cv_artifacts(seed_runs, X_train_valid_df, y_train_valid_array):
+    """基于多个seed的OOF结果构建真正用于集成决策的OOF工件。"""
+    if not seed_runs:
+        raise RuntimeError("未提供任何seed训练结果，无法构建multi-seed OOF工件。")
+
+    base_oof_detail = None
+    meta_prob_cols = []
+    blended_prob_cols = []
+    base_fold_frames = []
+    meta_fold_frames = []
+    seed_final_fold_frames = []
+
+    for seed_run in seed_runs:
+        seed = int(seed_run["seed"])
+        cv_artifacts = seed_run.get("cv_artifacts") or {}
+        oof_detail_df = cv_artifacts.get("oof_detail")
+        if oof_detail_df is None or oof_detail_df.empty:
+            continue
+
+        aligned_detail_df = (
+            oof_detail_df.copy()
+            .sort_values("source_row_index")
+            .reset_index(drop=True)
+        )
+        if base_oof_detail is None:
+            keep_cols = [
+                col for col in aligned_detail_df.columns
+                if col in {"source_row_index", "fold_id", "y_true", "EmployeeNumber", "Department", "JobRole"}
+            ]
+            base_oof_detail = aligned_detail_df[keep_cols].copy()
+        else:
+            if not np.array_equal(
+                np.asarray(base_oof_detail["source_row_index"]),
+                np.asarray(aligned_detail_df["source_row_index"])
+            ):
+                raise RuntimeError("多seed OOF样本顺序不一致，无法构建概率平均集成。")
+            if not np.array_equal(
+                np.asarray(base_oof_detail["y_true"]),
+                np.asarray(aligned_detail_df["y_true"])
+            ):
+                raise RuntimeError("多seed OOF标签顺序不一致，无法构建概率平均集成。")
+
+        meta_col = f"seed_{seed}_meta_oof_prob"
+        blended_col = f"seed_{seed}_blended_prob"
+        threshold_col = f"seed_{seed}_threshold"
+        pred_col = f"seed_{seed}_pred_label"
+        base_oof_detail[meta_col] = pd.to_numeric(aligned_detail_df["meta_oof_prob"], errors="coerce")
+        base_oof_detail[blended_col] = pd.to_numeric(aligned_detail_df["blended_prob"], errors="coerce")
+        base_oof_detail[threshold_col] = pd.to_numeric(aligned_detail_df["oof_threshold"], errors="coerce")
+        base_oof_detail[pred_col] = pd.to_numeric(aligned_detail_df["oof_pred_label"], errors="coerce").fillna(0).astype(int)
+        meta_prob_cols.append(meta_col)
+        blended_prob_cols.append(blended_col)
+
+        for artifact_key, frame_bucket in [
+            ("base_fold_metrics", base_fold_frames),
+            ("meta_raw_fold_metrics", meta_fold_frames),
+            ("final_oof_fold_metrics", seed_final_fold_frames),
+        ]:
+            metric_df = cv_artifacts.get(artifact_key)
+            if metric_df is None or metric_df.empty:
+                continue
+            metric_df = metric_df.copy()
+            metric_df.insert(0, "random_state", int(seed))
+            metric_df.insert(1, "run_label", seed_run.get("metrics", {}).get("run_label", f"ensemble_seed_{seed}"))
+            frame_bucket.append(metric_df)
+
+    if base_oof_detail is None or not meta_prob_cols:
+        raise RuntimeError("未能从seed运行结果中提取有效OOF概率，无法构建multi-seed ensemble。")
+
+    ensemble_oof_prob = base_oof_detail[meta_prob_cols].mean(axis=1).to_numpy(dtype=float)
+    ensemble_blended_prob = base_oof_detail[blended_prob_cols].mean(axis=1).to_numpy(dtype=float) if blended_prob_cols else ensemble_oof_prob
+    base_threshold, _ = optimize_classification_threshold(y_train_valid_array, ensemble_oof_prob)
+    threshold_strategy, segmented_oof_metrics = optimize_segment_thresholds(
+        y_train_valid_array, ensemble_oof_prob, X_train_valid_df, base_threshold
+    )
+    oof_threshold_array, oof_segment_labels = resolve_threshold_array(ensemble_oof_prob, threshold_strategy, X_train_valid_df)
+
+    base_oof_detail["ensemble_blended_oof_prob"] = ensemble_blended_prob
+    base_oof_detail["ensemble_meta_oof_prob"] = ensemble_oof_prob
+    base_oof_detail["ensemble_oof_threshold"] = np.asarray(oof_threshold_array, dtype=float)
+    base_oof_detail["ensemble_oof_pred_label"] = (
+        np.asarray(ensemble_oof_prob, dtype=float) >= np.asarray(oof_threshold_array, dtype=float)
+    ).astype(int)
+    if oof_segment_labels is not None:
+        base_oof_detail["ensemble_risk_segment"] = oof_segment_labels
+
+    ensemble_fold_rows = []
+    fold_ids = sorted([int(fold_id) for fold_id in pd.to_numeric(base_oof_detail["fold_id"], errors="coerce").dropna().unique() if int(fold_id) > 0])
+    for fold_id in fold_ids:
+        fold_mask = np.asarray(base_oof_detail["fold_id"] == fold_id)
+        fold_positions = np.where(fold_mask)[0]
+        fold_segment = oof_segment_labels[fold_mask] if oof_segment_labels is not None else None
+        ensemble_fold_rows.append(
+            build_fold_metric_row(
+                fold_id=fold_id,
+                stage="final_oof_ensemble",
+                model_name="multi_seed_ensemble",
+                y_true=np.asarray(y_train_valid_array)[fold_mask],
+                y_prob=ensemble_oof_prob[fold_mask],
+                threshold=oof_threshold_array[fold_mask],
+                train_size=int(len(y_train_valid_array) - len(fold_positions)),
+                valid_size=len(fold_positions),
+                threshold_strategy=threshold_strategy.get("type", "global") if isinstance(threshold_strategy, dict) else "global",
+                high_risk_share=float(np.mean(fold_segment == "high_risk")) if fold_segment is not None and len(fold_segment) else np.nan,
+            )
+        )
+    ensemble_final_oof_fold_metrics_df = pd.DataFrame(ensemble_fold_rows)
+    if not ensemble_final_oof_fold_metrics_df.empty:
+        ensemble_final_oof_fold_metrics_df.insert(0, "random_state", "ensemble")
+        ensemble_final_oof_fold_metrics_df.insert(1, "run_label", "multi_seed_ensemble")
+
+    all_fold_metrics_df = pd.concat(
+        [
+            pd.concat(base_fold_frames, ignore_index=True, sort=False) if base_fold_frames else pd.DataFrame(),
+            pd.concat(meta_fold_frames, ignore_index=True, sort=False) if meta_fold_frames else pd.DataFrame(),
+            pd.concat(seed_final_fold_frames, ignore_index=True, sort=False) if seed_final_fold_frames else pd.DataFrame(),
+            ensemble_final_oof_fold_metrics_df,
+        ],
+        ignore_index=True,
+        sort=False,
+    )
+    oof_metrics = {
+        "auc": safe_binary_auc(y_train_valid_array, ensemble_oof_prob),
+        "acc": segmented_oof_metrics["acc"],
+        "precision": segmented_oof_metrics["precision"],
+        "recall": segmented_oof_metrics["recall"],
+        "f1": segmented_oof_metrics["f1"],
+        "pred_positive_rate": segmented_oof_metrics["pred_positive_rate"],
+    }
+
+    return {
+        "base_fold_metrics": pd.concat(base_fold_frames, ignore_index=True, sort=False) if base_fold_frames else pd.DataFrame(),
+        "meta_raw_fold_metrics": pd.concat(meta_fold_frames, ignore_index=True, sort=False) if meta_fold_frames else pd.DataFrame(),
+        "final_oof_fold_metrics": pd.concat(
+            [pd.concat(seed_final_fold_frames, ignore_index=True, sort=False) if seed_final_fold_frames else pd.DataFrame(), ensemble_final_oof_fold_metrics_df],
+            ignore_index=True,
+            sort=False,
+        ),
+        "fold_summary": build_cv_summary_frame(all_fold_metrics_df),
+        "oof_detail": base_oof_detail,
+        "ensemble_threshold_strategy": threshold_strategy,
+        "ensemble_oof_metrics": oof_metrics,
+    }
+
+
+def train_multi_seed_ensemble(
+    X_df,
+    y,
+    preprocessor,
+    seed_list=None,
+    split_random_state=RANDOM_STATE,
+    run_label="multi_seed_ensemble",
+):
+    """训练真正的multi-seed ensemble：多个seed完整建模后做概率平均。"""
+    parsed_seeds = parse_seed_list(seed_list)
+    resolved_split_seed = normalize_random_state(split_random_state)
+    fixed_split = build_fixed_outer_split(X_df, y, split_random_state=resolved_split_seed)
+
+    logging.info("\n6A. 训练Multi-Seed Ensemble...")
+    logging.info("  - Seed列表：%s", ", ".join(str(seed) for seed in parsed_seeds))
+    logging.info("  - 外层切分固定为seed=%s，确保不同seed模型共享同一测试集", resolved_split_seed)
+
+    seed_runs = []
+    ensemble_preprocessor = None
+    X_train_valid_df = X_test_df = y_train_valid = y_test = None
+    for index, seed in enumerate(parsed_seeds, start=1):
+        logging.info("  - Seed %s/%s = %s | 开始训练完整子模型", index, len(parsed_seeds), seed)
+        seed_model, seed_preprocessor, X_train_valid_df, X_test_df, y_train_valid, y_test, seed_metrics, _, seed_cv_artifacts = train_stacking_lgb(
+            X_df,
+            y,
+            preprocessor,
+            random_state=seed,
+            run_label=f"ensemble_seed_{seed}",
+            fixed_split=fixed_split,
+            split_random_state=resolved_split_seed,
+            cv_random_state=resolved_split_seed,
+        )
+        if ensemble_preprocessor is None:
+            ensemble_preprocessor = seed_preprocessor
+        seed_runs.append({
+            "seed": int(seed),
+            "model": seed_model,
+            "metrics": seed_metrics,
+            "cv_artifacts": seed_cv_artifacts,
+            "used_primary_run": False,
+        })
+
+    y_train_valid_array = np.asarray(y_train_valid)
+    ensemble_cv_artifacts = build_multi_seed_cv_artifacts(seed_runs, X_train_valid_df, y_train_valid_array)
+    threshold_strategy = ensemble_cv_artifacts["ensemble_threshold_strategy"]
+    ensemble_oof_metrics = ensemble_cv_artifacts["ensemble_oof_metrics"]
+    seed_stability_artifacts = run_seed_stability_experiment(
+        X_df,
+        y,
+        preprocessor,
+        seed_list=parsed_seeds,
+        primary_seed=resolved_split_seed,
+        fixed_split=fixed_split,
+        cv_random_state=resolved_split_seed,
+        precomputed_seed_runs=seed_runs,
+    )
+
+    ensemble_model = MultiSeedEnsembleModel(
+        seed_models=[item["model"] for item in seed_runs],
+        seed_list=parsed_seeds,
+    )
+    X_train_valid_trans = ensemble_preprocessor.transform(X_train_valid_df)
+    X_test_trans = ensemble_preprocessor.transform(X_test_df)
+    y_train_prob = ensemble_model.predict_proba(X_train_valid_trans)[:, 1]
+    y_test_prob = ensemble_model.predict_proba(X_test_trans)[:, 1]
+    train_thresholds, train_segment_labels = resolve_threshold_array(y_train_prob, threshold_strategy, X_train_valid_df)
+    test_thresholds, test_segment_labels = resolve_threshold_array(y_test_prob, threshold_strategy, X_test_df)
+    train_eval = evaluate_binary_probabilities(y_train_valid_array, y_train_prob, train_thresholds)
+    test_eval = evaluate_binary_probabilities(np.asarray(y_test), y_test_prob, test_thresholds)
+
+    seed_metrics_df = seed_stability_artifacts.get("seed_metrics", pd.DataFrame())
+    blend_lgb_weight = float(pd.to_numeric(seed_metrics_df.get("blend_lgb_weight"), errors="coerce").mean()) if not seed_metrics_df.empty else np.nan
+    blend_lr_weight = float(pd.to_numeric(seed_metrics_df.get("blend_lr_weight"), errors="coerce").mean()) if not seed_metrics_df.empty else np.nan
+    blend_et_weight = float(pd.to_numeric(seed_metrics_df.get("blend_et_weight"), errors="coerce").mean()) if not seed_metrics_df.empty else np.nan
+    metrics = {
+        "train_auc": roc_auc_score(y_train_valid, y_train_prob),
+        "valid_auc": ensemble_oof_metrics["auc"],
+        "test_auc": roc_auc_score(y_test, y_test_prob),
+        "train_acc": train_eval["acc"],
+        "valid_acc": ensemble_oof_metrics["acc"],
+        "test_acc": test_eval["acc"],
+        "train_precision": train_eval["precision"],
+        "valid_precision": ensemble_oof_metrics["precision"],
+        "test_precision": test_eval["precision"],
+        "train_recall": train_eval["recall"],
+        "valid_recall": ensemble_oof_metrics["recall"],
+        "test_recall": test_eval["recall"],
+        "train_pred_positive_rate": train_eval["pred_positive_rate"],
+        "valid_pred_positive_rate": ensemble_oof_metrics["pred_positive_rate"],
+        "test_pred_positive_rate": test_eval["pred_positive_rate"],
+        "train_f1": train_eval["f1"],
+        "valid_f1": ensemble_oof_metrics["f1"],
+        "test_f1": test_eval["f1"],
+        "blend_lgb_weight": blend_lgb_weight,
+        "blend_lr_weight": blend_lr_weight,
+        "blend_et_weight": blend_et_weight,
+        "ensemble_strategy": "multi_seed_probability_average",
+        "feature_strategy": "full_enhanced_features",
+        "probability_calibration": "none",
+        "random_state": "multi_seed",
+        "split_random_state": resolved_split_seed,
+        "cv_random_state": resolved_split_seed,
+        "run_label": run_label,
+        "threshold_strategy": threshold_strategy.get("type", "global"),
+        "best_threshold": float(threshold_strategy.get("base_threshold", 0.5)),
+        "high_risk_threshold": float(threshold_strategy.get("high_risk", threshold_strategy.get("global_threshold", 0.5))),
+        "standard_threshold": float(threshold_strategy.get("standard", threshold_strategy.get("global_threshold", 0.5))),
+        "target_pred_positive_rate": float(threshold_strategy.get("target_pred_positive_rate", target_pred_positive_rate(y_train_valid_array))),
+        "min_pred_positive_rate": float(threshold_strategy.get("min_pred_positive_rate", PRED_POSITIVE_RATE_MIN)),
+        "max_pred_positive_rate": float(threshold_strategy.get("max_pred_positive_rate", PRED_POSITIVE_RATE_MAX)),
+        "train_high_risk_share": float(np.mean(train_segment_labels == "high_risk")) if train_segment_labels is not None and len(train_segment_labels) else 0.0,
+        "test_high_risk_share": float(np.mean(test_segment_labels == "high_risk")) if test_segment_labels is not None and len(test_segment_labels) else 0.0,
+        "selected_num_features": int(seed_metrics_df["selected_num_features"].iloc[0]) if not seed_metrics_df.empty else 0,
+        "selected_cat_features": int(seed_metrics_df["selected_cat_features"].iloc[0]) if not seed_metrics_df.empty else 0,
+        "selected_total_features": int(seed_metrics_df["selected_total_features"].iloc[0]) if not seed_metrics_df.empty else 0,
+        "seed_model_count": int(len(parsed_seeds)),
+        "seed_list_text": ", ".join(str(seed) for seed in parsed_seeds),
+    }
+    metrics.update(build_generalization_diagnostics(metrics))
+
+    logging.info("✅ Multi-Seed Ensemble训练完成，评估结果：")
+    logging.info(
+        "  - 运行标识：%s | Seed数量：%s | Seed列表：%s",
+        run_label, len(parsed_seeds), metrics["seed_list_text"]
+    )
+    logging.info(
+        "  - 外层切分种子：%s | 共享OOF/CV切分种子：%s",
+        resolved_split_seed, resolved_split_seed
+    )
+    logging.info(
+        "  - Ensemble OOF-AUC：%.4f | Ensemble OOF-Acc：%.4f | Ensemble OOF-F1：%.4f",
+        metrics["valid_auc"], metrics["valid_acc"], metrics["valid_f1"]
+    )
+    logging.info("  - 集成策略：%s", metrics["ensemble_strategy"])
+    logging.info("  - 阈值策略：%s | 高风险阈值：%.2f | 常规阈值：%.2f | 目标名单率：%.4f | 允许区间：%.4f-%.4f | 测试高风险组占比：%.4f",
+        metrics["threshold_strategy"], metrics["high_risk_threshold"], metrics["standard_threshold"],
+        metrics["target_pred_positive_rate"], metrics["min_pred_positive_rate"], metrics["max_pred_positive_rate"],
+        metrics["test_high_risk_share"]
+    )
+    logging.info(
+        "  - 平均融合权重(LGB/LR/ET)=%.2f/%.2f/%.2f",
+        metrics["blend_lgb_weight"], metrics["blend_lr_weight"], metrics["blend_et_weight"]
+    )
+    logging.info(
+        "  - 训练内样本AUC(仅参考)：%.4f | OOF-AUC：%.4f | 测试AUC：%.4f | OOF/Test差值：%+.4f",
+        metrics["train_auc"], metrics["valid_auc"], metrics["test_auc"], metrics["oof_test_auc_gap"]
+    )
+    logging.info(
+        "  - 泛化诊断：%s | 训练/OOF乐观差：%+.4f | 预警阈值：%.2f",
+        metrics["generalization_warning"], metrics.get("train_oof_auc_gap", float("nan")),
+        metrics["generalization_warning_gap_threshold"]
+    )
+    logging.info(
+        "  - 测试Precision：%.4f | 测试Recall：%.4f | 测试F1：%.4f",
+        metrics["test_precision"], metrics["test_recall"], metrics["test_f1"]
+    )
+
+    return (
+        ensemble_model,
+        ensemble_preprocessor,
+        X_train_valid_df,
+        X_test_df,
+        y_train_valid,
+        y_test,
+        metrics,
+        threshold_strategy,
+        ensemble_cv_artifacts,
+        seed_stability_artifacts,
+    )
 
 
 # -----------------------
@@ -2167,10 +3645,14 @@ def compute_shap_top3_and_export(model, preprocessor, X_test_df, df_test, out_pr
         logging.info("🔍 尝试获取LightGBM子模型...")
         # 调试：打印模型结构
         logging.info(f"🔍 模型类型: {type(model)}")
-        logging.info(f"🔍 模型命名估计器: {list(model.named_estimators_.keys())}")
+        logging.info(f"🔍 模型命名估计器: {list(getattr(model, 'named_estimators_', {}).keys())}")
 
-        lgb_model = model.named_estimators_['lgb']
+        lgb_model = get_reference_lgb_model(model)
+        if lgb_model is None:
+            raise RuntimeError("未找到可用于SHAP解释的LightGBM子模型")
         logging.info(f"🔍 LightGBM模型类型: {type(lgb_model)}")
+        if getattr(model, "seed_model_count", 1) > 1:
+            logging.info("🔍 当前为multi-seed ensemble，SHAP使用代表seed的LightGBM子模型进行解释")
 
         logging.info("🔍 创建SHAP解释器...")
         explainer = shap.TreeExplainer(lgb_model)
@@ -2228,9 +3710,27 @@ def compute_shap_top3_and_export(model, preprocessor, X_test_df, df_test, out_pr
 
 
 METRIC_LABEL_MAP = {
-    "train_auc": "训练集AUC",
-    "valid_auc": "验证集AUC",
+    "random_state": "随机种子",
+    "split_random_state": "外层切分种子",
+    "cv_random_state": "交叉验证切分种子",
+    "run_label": "运行标识",
+    "seed_model_count": "集成seed数量",
+    "seed_list_text": "集成seed列表",
+    "lgb_early_stopping_enabled": "LightGBM早停启用",
+    "lgb_early_stopping_best_iteration": "LightGBM早停最佳树数",
+    "lgb_early_stopping_valid_auc": "LightGBM早停验证AUC",
+    "lgb_early_stopping_valid_size": "LightGBM早停验证集占比",
+    "lgb_early_stopping_reason": "LightGBM早停状态",
+    "train_auc": "训练内样本AUC(仅参考)",
+    "valid_auc": "OOF验证AUC",
     "test_auc": "测试集AUC",
+    "train_oof_auc_gap": "训练/OOF AUC乐观差",
+    "train_test_auc_gap": "训练/Test AUC差",
+    "oof_test_auc_gap": "OOF/Test AUC差值",
+    "oof_test_auc_gap_abs": "OOF/Test AUC绝对差",
+    "generalization_warning": "泛化诊断",
+    "generalization_warning_gap_threshold": "泛化预警阈值",
+    "train_auc_interpretation": "训练AUC解释",
     "train_acc": "训练集Accuracy",
     "valid_acc": "验证集Accuracy",
     "test_acc": "测试集Accuracy",
@@ -2249,6 +3749,9 @@ METRIC_LABEL_MAP = {
     "best_threshold": "基础阈值",
     "high_risk_threshold": "高风险组阈值",
     "standard_threshold": "常规组阈值",
+    "target_pred_positive_rate": "目标预测流失率",
+    "min_pred_positive_rate": "最小预测流失率",
+    "max_pred_positive_rate": "最大预测流失率",
     "train_high_risk_share": "训练集高风险占比",
     "test_high_risk_share": "测试集高风险占比",
     "blend_lgb_weight": "融合权重-LGB",
@@ -2264,16 +3767,107 @@ METRIC_LABEL_MAP = {
 }
 
 
+def build_seed_metric_row(random_state, metrics, used_primary_run=False):
+    """构建单个seed的稳定性指标记录。"""
+    export_keys = [
+        "train_auc", "valid_auc", "test_auc",
+        "train_acc", "valid_acc", "test_acc",
+        "train_f1", "valid_f1", "test_f1",
+        "train_precision", "valid_precision", "test_precision",
+        "train_recall", "valid_recall", "test_recall",
+        "train_pred_positive_rate", "valid_pred_positive_rate", "test_pred_positive_rate",
+        "train_oof_auc_gap", "train_test_auc_gap", "oof_test_auc_gap", "oof_test_auc_gap_abs",
+        "generalization_warning_gap_threshold",
+        "best_threshold", "high_risk_threshold", "standard_threshold",
+        "target_pred_positive_rate", "min_pred_positive_rate", "max_pred_positive_rate",
+        "blend_lgb_weight", "blend_lr_weight", "blend_et_weight",
+        "lgb_early_stopping_best_iteration", "lgb_early_stopping_valid_auc", "lgb_early_stopping_valid_size",
+        "train_high_risk_share", "test_high_risk_share",
+        "selected_num_features", "selected_cat_features", "selected_total_features",
+    ]
+    row = {
+        "random_state": int(normalize_random_state(random_state)),
+        "used_primary_run": bool(used_primary_run),
+        "threshold_strategy": metrics.get("threshold_strategy"),
+        "ensemble_strategy": metrics.get("ensemble_strategy"),
+        "feature_strategy": metrics.get("feature_strategy"),
+        "probability_calibration": metrics.get("probability_calibration"),
+        "lgb_early_stopping_enabled": metrics.get("lgb_early_stopping_enabled"),
+        "lgb_early_stopping_reason": metrics.get("lgb_early_stopping_reason"),
+        "generalization_warning": metrics.get("generalization_warning"),
+        "train_auc_interpretation": metrics.get("train_auc_interpretation"),
+        "run_label": metrics.get("run_label", ""),
+    }
+    for key in export_keys:
+        row[key] = metrics.get(key)
+    return row
+
+
+def build_seed_stability_summary(seed_metrics_df):
+    """汇总多seed实验的均值、波动范围和最佳/最差seed。"""
+    if seed_metrics_df is None or seed_metrics_df.empty:
+        return pd.DataFrame()
+
+    summary_metric_cols = [
+        "valid_auc", "test_auc", "train_oof_auc_gap", "oof_test_auc_gap_abs",
+        "valid_f1", "test_f1",
+        "valid_precision", "test_precision",
+        "valid_recall", "test_recall",
+        "valid_acc", "test_acc",
+        "best_threshold",
+        "blend_lgb_weight", "blend_lr_weight", "blend_et_weight",
+    ]
+    summary_rows = []
+    for metric_col in summary_metric_cols:
+        metric_series = pd.to_numeric(seed_metrics_df[metric_col], errors="coerce")
+        valid_mask = metric_series.notna()
+        if not valid_mask.any():
+            continue
+        metric_df = seed_metrics_df.loc[valid_mask, ["random_state"]].copy()
+        metric_df["metric_value"] = metric_series.loc[valid_mask].astype(float)
+        max_idx = metric_df["metric_value"].idxmax()
+        min_idx = metric_df["metric_value"].idxmin()
+        summary_rows.append({
+            "metric_code": metric_col,
+            "metric_name": METRIC_LABEL_MAP.get(metric_col, metric_col),
+            "seed_count": int(len(metric_df)),
+            "mean": float(metric_df["metric_value"].mean()),
+            "std": float(metric_df["metric_value"].std(ddof=0)),
+            "min": float(metric_df["metric_value"].min()),
+            "max": float(metric_df["metric_value"].max()),
+            "range": float(metric_df["metric_value"].max() - metric_df["metric_value"].min()),
+            "best_seed": int(seed_metrics_df.loc[max_idx, "random_state"]),
+            "worst_seed": int(seed_metrics_df.loc[min_idx, "random_state"]),
+        })
+
+    return pd.DataFrame(summary_rows)
+
+
+def build_fixed_outer_split(X_df, y, split_random_state=RANDOM_STATE):
+    """构建固定的外层train_valid/test划分，便于多seed模型共享同一评估基准。"""
+    resolved_split_seed = normalize_random_state(split_random_state)
+    return train_test_split(
+        X_df,
+        y,
+        test_size=TEST_SIZE,
+        stratify=y,
+        random_state=resolved_split_seed,
+    )
+
+
 def build_metrics_export_frames(metrics):
     """构建更易读的指标导出表（核心指标 + 完整指标）。"""
     core_keys = [
         "train_auc", "valid_auc", "test_auc",
+        "train_oof_auc_gap", "oof_test_auc_gap", "oof_test_auc_gap_abs",
+        "generalization_warning", "generalization_warning_gap_threshold",
         "train_acc", "valid_acc", "test_acc",
         "train_f1", "valid_f1", "test_f1",
         "train_precision", "valid_precision", "test_precision",
         "train_recall", "valid_recall", "test_recall",
         "test_pred_positive_rate",
         "best_threshold", "high_risk_threshold", "standard_threshold",
+        "target_pred_positive_rate", "min_pred_positive_rate", "max_pred_positive_rate",
         "train_high_risk_share", "test_high_risk_share",
     ]
 
@@ -2297,41 +3891,395 @@ def build_metrics_export_frames(metrics):
 
     return pd.DataFrame(core_rows), pd.DataFrame(full_rows)
 
+
+def run_seed_stability_experiment(
+    X_df,
+    y,
+    preprocessor,
+    seed_list=None,
+    primary_seed=RANDOM_STATE,
+    primary_result=None,
+    fixed_split=None,
+    cv_random_state=None,
+    precomputed_seed_runs=None,
+):
+    """运行多seed稳定性实验，输出整体指标与最终OOF折内明细。"""
+    parsed_seeds = parse_seed_list(
+        seed_list if precomputed_seed_runs is None else [item.get("seed") for item in precomputed_seed_runs]
+    )
+    primary_seed = normalize_random_state(primary_seed)
+
+    seed_metric_rows = []
+    seed_fold_frames = []
+    primary_result_consumed = False
+
+    logging.info("\n7A. 运行随机种子稳定性实验...")
+    logging.info("  - Seed列表：%s", ", ".join(str(seed) for seed in parsed_seeds))
+
+    if precomputed_seed_runs:
+        for index, seed_run in enumerate(precomputed_seed_runs, start=1):
+            seed = int(seed_run.get("seed"))
+            metrics = dict(seed_run.get("metrics") or {})
+            cv_artifacts = seed_run.get("cv_artifacts") or {}
+            reused_primary = bool(seed_run.get("used_primary_run", False))
+            logging.info(
+                "  - Seed %s/%s = %s | 复用已完成训练结果进行稳定性汇总",
+                index, len(precomputed_seed_runs), seed
+            )
+
+            seed_metric_rows.append(
+                build_seed_metric_row(
+                    random_state=seed,
+                    metrics=metrics,
+                    used_primary_run=reused_primary,
+                )
+            )
+
+            final_oof_fold_metrics_df = cv_artifacts.get("final_oof_fold_metrics")
+            if final_oof_fold_metrics_df is not None and not final_oof_fold_metrics_df.empty:
+                fold_df = final_oof_fold_metrics_df.copy()
+                fold_df.insert(0, "random_state", int(seed))
+                fold_df.insert(1, "used_primary_run", bool(reused_primary))
+                seed_fold_frames.append(fold_df)
+    else:
+        for index, seed in enumerate(parsed_seeds, start=1):
+            reused_primary = False
+            if (
+                not primary_result_consumed
+                and primary_result is not None
+                and int(seed) == int(primary_seed)
+            ):
+                metrics = dict(primary_result.get("metrics") or {})
+                cv_artifacts = primary_result.get("cv_artifacts") or {}
+                reused_primary = True
+                primary_result_consumed = True
+                logging.info(
+                    "  - Seed %s/%s = %s | 复用主训练结果，避免重复训练",
+                    index, len(parsed_seeds), seed
+                )
+            else:
+                logging.info(
+                    "  - Seed %s/%s = %s | 开始重新训练稳定性子实验",
+                    index, len(parsed_seeds), seed
+                )
+                _, _, _, _, _, _, metrics, _, cv_artifacts = train_stacking_lgb(
+                    X_df,
+                    y,
+                    preprocessor,
+                    random_state=seed,
+                    run_label=f"seed_stability_{seed}",
+                    fixed_split=fixed_split,
+                    split_random_state=primary_seed,
+                    cv_random_state=cv_random_state,
+                )
+
+            seed_metric_rows.append(
+                build_seed_metric_row(
+                    random_state=seed,
+                    metrics=metrics,
+                    used_primary_run=reused_primary,
+                )
+            )
+
+            final_oof_fold_metrics_df = None
+            if cv_artifacts:
+                final_oof_fold_metrics_df = cv_artifacts.get("final_oof_fold_metrics")
+            if final_oof_fold_metrics_df is not None and not final_oof_fold_metrics_df.empty:
+                fold_df = final_oof_fold_metrics_df.copy()
+                fold_df.insert(0, "random_state", int(seed))
+                fold_df.insert(1, "used_primary_run", bool(reused_primary))
+                seed_fold_frames.append(fold_df)
+
+    seed_metrics_df = pd.DataFrame(seed_metric_rows)
+    seed_fold_df = pd.concat(seed_fold_frames, ignore_index=True, sort=False) if seed_fold_frames else pd.DataFrame()
+    seed_summary_df = build_seed_stability_summary(seed_metrics_df)
+    experiment_info_df = pd.DataFrame([
+        {"item": "seed_count", "value": int(len(parsed_seeds)), "note": "Number of random seeds included in the stability experiment"},
+        {"item": "seed_list", "value": ", ".join(str(seed) for seed in parsed_seeds), "note": "Ordered seed list used for repeated runs"},
+        {"item": "primary_seed", "value": int(primary_seed), "note": "Seed used for the main pipeline run"},
+        {"item": "primary_reused", "value": bool(primary_result is not None and primary_seed in parsed_seeds), "note": "Whether the main run result was reused inside the seed experiment"},
+    ])
+
+    overview = {}
+    if not seed_summary_df.empty:
+        for metric_code in ["test_auc", "test_f1", "test_precision", "test_recall", "valid_auc", "valid_f1"]:
+            metric_match = seed_summary_df[seed_summary_df["metric_code"] == metric_code]
+            if metric_match.empty:
+                continue
+            overview[metric_code] = {
+                "mean": float(metric_match["mean"].iloc[0]),
+                "std": float(metric_match["std"].iloc[0]),
+                "range": float(metric_match["range"].iloc[0]),
+            }
+
+    if overview:
+        test_auc_stats = overview.get("test_auc")
+        test_f1_stats = overview.get("test_f1")
+        if test_auc_stats is not None:
+            logging.info(
+                "  - Seed稳定性(Test AUC)：%.4f ± %.4f | 波动范围=%.4f",
+                test_auc_stats["mean"], test_auc_stats["std"], test_auc_stats["range"]
+            )
+        if test_f1_stats is not None:
+            logging.info(
+                "  - Seed稳定性(Test F1)：%.4f ± %.4f | 波动范围=%.4f",
+                test_f1_stats["mean"], test_f1_stats["std"], test_f1_stats["range"]
+            )
+
+    return {
+        "seed_list": parsed_seeds,
+        "seed_metrics": seed_metrics_df,
+        "seed_summary": seed_summary_df,
+        "seed_final_oof_folds": seed_fold_df,
+        "experiment_info": experiment_info_df,
+        "overview": overview,
+    }
+
+
+def export_seed_stability_artifacts(seed_stability_artifacts, out_prefix="employee_risk"):
+    """导出多seed稳定性实验结果。"""
+    if not seed_stability_artifacts:
+        return None
+
+    out_prefix = os.path.join(CURRENT_DIR, out_prefix)
+    save_path = f"{out_prefix}_seed_stability_report.xlsx"
+    sheet_frames = {}
+
+    experiment_info_df = seed_stability_artifacts.get("experiment_info")
+    if experiment_info_df is not None and not experiment_info_df.empty:
+        sheet_frames["Experiment Info"] = experiment_info_df.copy()
+
+    seed_metrics_df = seed_stability_artifacts.get("seed_metrics")
+    if seed_metrics_df is not None and not seed_metrics_df.empty:
+        sheet_frames["Seed Metrics"] = seed_metrics_df.copy()
+
+    seed_summary_df = seed_stability_artifacts.get("seed_summary")
+    if seed_summary_df is not None and not seed_summary_df.empty:
+        sheet_frames["Metric Summary"] = seed_summary_df.copy()
+
+    seed_fold_df = seed_stability_artifacts.get("seed_final_oof_folds")
+    if seed_fold_df is not None and not seed_fold_df.empty:
+        sheet_frames["Final OOF Folds"] = seed_fold_df.copy()
+        if "random_state" in seed_fold_df.columns:
+            for seed in sorted({int(seed) for seed in pd.to_numeric(seed_fold_df["random_state"], errors="coerce").dropna().tolist()}):
+                sheet_frames[f"Seed{seed} Folds"] = (
+                    seed_fold_df[seed_fold_df["random_state"] == seed]
+                    .copy()
+                    .reset_index(drop=True)
+                )
+
+    if not sheet_frames:
+        return None
+
+    percent_cols_map = {
+        "Seed Metrics": [
+            "train_auc", "valid_auc", "test_auc",
+            "train_oof_auc_gap", "train_test_auc_gap", "oof_test_auc_gap", "oof_test_auc_gap_abs",
+            "generalization_warning_gap_threshold",
+            "train_acc", "valid_acc", "test_acc",
+            "train_f1", "valid_f1", "test_f1",
+            "train_precision", "valid_precision", "test_precision",
+            "train_recall", "valid_recall", "test_recall",
+            "train_pred_positive_rate", "valid_pred_positive_rate", "test_pred_positive_rate",
+            "best_threshold", "high_risk_threshold", "standard_threshold",
+            "target_pred_positive_rate", "min_pred_positive_rate", "max_pred_positive_rate",
+            "blend_lgb_weight", "blend_lr_weight", "blend_et_weight",
+            "train_high_risk_share", "test_high_risk_share",
+        ],
+        "Metric Summary": ["mean", "std", "min", "max", "range"],
+        "Final OOF Folds": [
+            "valid_positive_rate", "auc", "acc", "precision", "recall", "f1",
+            "pred_positive_rate", "threshold_value", "high_risk_share"
+        ],
+    }
+    heatmap_cols_map = {
+        "Seed Metrics": ["test_auc", "test_f1", "test_precision", "test_recall", "valid_auc", "oof_test_auc_gap_abs", "valid_f1"],
+        "Metric Summary": ["mean", "std", "range"],
+        "Final OOF Folds": ["auc", "precision", "recall", "f1"],
+    }
+    for sheet_name in sheet_frames:
+        if sheet_name.startswith("Seed") and sheet_name.endswith("Folds"):
+            percent_cols_map[sheet_name] = percent_cols_map["Final OOF Folds"]
+            heatmap_cols_map[sheet_name] = heatmap_cols_map["Final OOF Folds"]
+
+    save_friendly_excel(
+        save_path,
+        sheet_frames=sheet_frames,
+        percent_cols_map=percent_cols_map,
+        heatmap_cols_map=heatmap_cols_map,
+    )
+    logging.info("✅ Seed稳定性报告已保存：%s", save_path)
+    return save_path
+
+
+def export_cv_fold_artifacts(cv_artifacts, out_prefix="employee_risk"):
+    """导出5-fold各折指标与OOF明细，便于泛化稳定性分析。"""
+    if not cv_artifacts:
+        return None
+
+    out_prefix = os.path.join(CURRENT_DIR, out_prefix)
+    save_path = f"{out_prefix}_5fold交叉验证明细.xlsx"
+    sheet_frames = {}
+
+    if cv_artifacts.get("base_fold_metrics") is not None and not cv_artifacts["base_fold_metrics"].empty:
+        sheet_frames["基础模型折指标"] = cv_artifacts["base_fold_metrics"].copy()
+    if cv_artifacts.get("meta_raw_fold_metrics") is not None and not cv_artifacts["meta_raw_fold_metrics"].empty:
+        sheet_frames["二层原始折指标"] = cv_artifacts["meta_raw_fold_metrics"].copy()
+    if cv_artifacts.get("final_oof_fold_metrics") is not None and not cv_artifacts["final_oof_fold_metrics"].empty:
+        sheet_frames["最终OOF折指标"] = cv_artifacts["final_oof_fold_metrics"].copy()
+    if cv_artifacts.get("fold_summary") is not None and not cv_artifacts["fold_summary"].empty:
+        sheet_frames["折指标汇总"] = cv_artifacts["fold_summary"].copy()
+    oof_detail_df = cv_artifacts.get("oof_detail")
+    if oof_detail_df is not None and not oof_detail_df.empty:
+        sheet_frames["OOF逐样本明细"] = oof_detail_df.copy()
+        if "fold_id" in oof_detail_df.columns:
+            fold_ids = []
+            for fold_value in pd.unique(oof_detail_df["fold_id"]):
+                if pd.isna(fold_value):
+                    continue
+                fold_id = int(fold_value)
+                if fold_id <= 0:
+                    continue
+                fold_ids.append(fold_id)
+            for fold_id in sorted(set(fold_ids)):
+                sheet_frames[f"Fold{fold_id}验证明细"] = (
+                    oof_detail_df[oof_detail_df["fold_id"] == fold_id]
+                    .copy()
+                    .reset_index(drop=True)
+                )
+
+    if not sheet_frames:
+        return None
+
+    oof_detail_percent_cols = [
+        "lgb_prob", "lr_prob", "et_prob", "blended_prob",
+        "mean_prob", "std_prob", "meta_oof_prob", "oof_threshold",
+        "ensemble_blended_oof_prob", "ensemble_meta_oof_prob", "ensemble_oof_threshold"
+    ]
+    percent_cols_map = {
+        "基础模型折指标": ["valid_positive_rate", "auc", "acc", "precision", "recall", "f1", "pred_positive_rate", "threshold_value", "high_risk_share"],
+        "二层原始折指标": ["valid_positive_rate", "auc", "acc", "precision", "recall", "f1", "pred_positive_rate", "threshold_value", "high_risk_share"],
+        "最终OOF折指标": ["valid_positive_rate", "auc", "acc", "precision", "recall", "f1", "pred_positive_rate", "threshold_value", "high_risk_share"],
+        "折指标汇总": [
+            "auc_mean", "auc_std", "acc_mean", "acc_std", "precision_mean", "precision_std",
+            "recall_mean", "recall_std", "f1_mean", "f1_std", "pred_positive_rate_mean",
+            "pred_positive_rate_std", "valid_positive_rate_mean", "valid_positive_rate_std",
+            "high_risk_share_mean", "high_risk_share_std"
+        ],
+        "OOF逐样本明细": oof_detail_percent_cols,
+    }
+    heatmap_cols_map = {
+        "基础模型折指标": ["auc", "precision", "recall", "f1"],
+        "二层原始折指标": ["auc", "precision", "recall", "f1"],
+        "最终OOF折指标": ["auc", "precision", "recall", "f1"],
+        "折指标汇总": ["auc_mean", "precision_mean", "recall_mean", "f1_mean"],
+        "OOF逐样本明细": ["meta_oof_prob", "oof_threshold", "ensemble_meta_oof_prob", "ensemble_oof_threshold"],
+    }
+    for sheet_name in sheet_frames:
+        if sheet_name.startswith("Fold") and sheet_name.endswith("验证明细"):
+            percent_cols_map[sheet_name] = oof_detail_percent_cols
+            heatmap_cols_map[sheet_name] = ["meta_oof_prob", "oof_threshold", "ensemble_meta_oof_prob", "ensemble_oof_threshold"]
+    save_friendly_excel(
+        save_path,
+        sheet_frames=sheet_frames,
+        percent_cols_map=percent_cols_map,
+        heatmap_cols_map=heatmap_cols_map,
+    )
+    logging.info("✅ 5-fold交叉验证明细已保存：%s", save_path)
+    return save_path
+
 # -----------------------
 # 最终结果输出（预测名单+政策缺口）
 # -----------------------
-def generate_outputs_and_reports(df_emp, model, preprocessor, X_test_df, y_test, metrics, threshold=0.5, out_prefix="employee_risk"):
+def build_prediction_detail_frame(model, preprocessor, feature_df, actual_labels=None, threshold=0.5):
+    """Predict a feature frame and append model-facing risk columns."""
+    working_features = feature_df.copy()
+    transformed = preprocessor.transform(working_features)
+    y_pred_prob = model.predict_proba(transformed)[:, 1]
+    threshold_array, segment_labels = resolve_threshold_array(y_pred_prob, threshold, working_features)
+    y_pred_label = (y_pred_prob >= threshold_array).astype(int)
+
+    detail_df = working_features.copy()
+    detail_df.insert(0, "源数据行号", working_features.index.to_numpy())
+    detail_df["流失概率"] = y_pred_prob.round(3)
+    detail_df["预测流失标签"] = y_pred_label
+    if actual_labels is not None:
+        if isinstance(actual_labels, pd.Series):
+            actual_series = actual_labels.reindex(working_features.index)
+        else:
+            actual_series = pd.Series(actual_labels, index=working_features.index)
+        detail_df["实际流失标签"] = actual_series.to_numpy()
+    detail_df["预测阈值"] = np.round(threshold_array, 3)
+    if segment_labels is not None:
+        detail_df["风险分层"] = segment_labels
+    return detail_df.sort_values("流失概率", ascending=False).reset_index(drop=True)
+
+
+def generate_outputs_and_reports(
+    df_emp,
+    model,
+    preprocessor,
+    X_test_df,
+    y_test,
+    metrics,
+    threshold=0.5,
+    out_prefix="employee_risk",
+    cv_artifacts=None,
+    seed_stability_artifacts=None,
+):
     """输出员工风险预测名单、Top3风险驱动、政策缺口岗位"""
     # 输出路径（当前目录）
     out_prefix = os.path.join(CURRENT_DIR, out_prefix)
+    output_manifest = {}
 
-    # 1. 预测测试集风险
-    X_test_trans = preprocessor.transform(X_test_df)
-    y_pred_prob = model.predict_proba(X_test_trans)[:, 1]
-    threshold_array, segment_labels = resolve_threshold_array(y_pred_prob, threshold, X_test_df)
-    y_pred_label = (y_pred_prob >= threshold_array).astype(int)
+    # 1. 预测全量员工风险；测试集仍单独保留用于评估追踪。
+    full_feature_df = df_emp.drop(columns=["AttritionFlag"], errors="ignore")
+    full_actual = df_emp["AttritionFlag"] if "AttritionFlag" in df_emp.columns else None
+    df_out_sorted = build_prediction_detail_frame(
+        model,
+        preprocessor,
+        full_feature_df,
+        actual_labels=full_actual,
+        threshold=threshold,
+    )
+    test_detail_df = build_prediction_detail_frame(
+        model,
+        preprocessor,
+        X_test_df,
+        actual_labels=y_test,
+        threshold=threshold,
+    )
+    df_out_sorted, tier_summary_df, tier_config = apply_business_tiers(df_out_sorted)
+    test_detail_df, _, _ = apply_business_tiers(test_detail_df)
+    topk_metrics_df = build_topk_metrics_frame(
+        test_detail_df["实际流失标签"].to_numpy(dtype=int),
+        pd.to_numeric(test_detail_df["流失概率"], errors="coerce").to_numpy(dtype=float),
+    )
 
-    # 整理输出数据
-    df_out = X_test_df.copy()
-    df_out['流失概率'] = y_pred_prob.round(3)
-    df_out['预测流失标签'] = y_pred_label
-    df_out['实际流失标签'] = y_test.values
-    df_out['预测阈值'] = np.round(threshold_array, 3)
-    if segment_labels is not None:
-        df_out['风险分层'] = segment_labels
-
-    df_out_sorted = df_out.sort_values("流失概率", ascending=False).reset_index(drop=True)
     high_risk_df = df_out_sorted[df_out_sorted["预测流失标签"] == 1].copy()
     if high_risk_df.empty:
         high_risk_df = df_out_sorted.head(min(30, len(df_out_sorted))).copy()
+    priority_df = df_out_sorted[df_out_sorted["名单层级"] == "高优先级干预"].copy()
+    watch_df = df_out_sorted[df_out_sorted["名单层级"] == "观察名单"].copy()
 
     threshold_desc = threshold.get("type", "global") if isinstance(threshold, dict) else "global"
     summary_df = pd.DataFrame([
-        {"指标": "测试样本数", "值": int(len(df_out_sorted)), "说明": "本次用于预测的员工样本数"},
+        {"指标": "全量预测样本数", "值": int(len(df_out_sorted)), "说明": "本次导出的全量员工样本数"},
+        {"指标": "测试集样本数", "值": int(len(test_detail_df)), "说明": "用于模型评估的留出测试集样本数"},
         {"指标": "高风险人数(预测)", "值": int(df_out_sorted["预测流失标签"].sum()), "说明": "预测流失标签=1的人数"},
-        {"指标": "高风险占比(预测)", "值": float(np.mean(df_out_sorted["预测流失标签"])), "说明": "高风险人数 / 测试样本数"},
-        {"指标": "平均流失概率", "值": float(df_out_sorted["流失概率"].mean()), "说明": "测试集员工平均流失概率"},
+        {"指标": "高风险占比(预测)", "值": float(np.mean(df_out_sorted["预测流失标签"])), "说明": "高风险人数 / 全量预测样本数"},
+        {"指标": "平均流失概率", "值": float(df_out_sorted["流失概率"].mean()), "说明": "全量员工平均流失概率"},
+        {"指标": "测试集AUC", "值": metrics.get("test_auc", ""), "说明": "留出测试集排序能力"},
+        {"指标": "测试集Precision", "值": metrics.get("test_precision", ""), "说明": "测试集预测流失名单中的真实流失占比"},
+        {"指标": "测试集Recall", "值": metrics.get("test_recall", ""), "说明": "测试集真实流失员工被召回的占比"},
         {"指标": "阈值策略", "值": threshold_desc, "说明": "模型使用的风险阈值方案"},
+        {"指标": "Top-K评估配置", "值": TOPK_EVAL_RATES_TEXT, "说明": "可用HR_TOPK_EVAL_RATES调整，如0.05,0.10,0.15,0.20"},
+        {"指标": "高优先级目标占比", "值": tier_config["priority_share"], "说明": "可用HR_PRIORITY_INTERVENTION_SHARE调整"},
+        {"指标": "高优先级人数", "值": tier_config["priority_count"], "说明": "按流失概率排名截取的重点干预人数"},
+        {"指标": "高优先级概率阈值", "值": tier_config["priority_threshold"], "说明": tier_config["threshold_basis"]},
+        {"指标": "观察名单累计目标占比", "值": tier_config["watch_share"], "说明": "可用HR_WATCHLIST_SHARE调整，包含高优先级在内的累计覆盖"},
+        {"指标": "观察名单累计人数", "值": tier_config["watch_count"], "说明": "高优先级 + 观察名单的累计覆盖人数"},
+        {"指标": "观察名单概率阈值", "值": tier_config["watch_threshold"], "说明": tier_config["threshold_basis"]},
     ])
 
     # 保存预测名单（友好版）
@@ -2341,19 +4289,48 @@ def generate_outputs_and_reports(df_emp, model, preprocessor, X_test_df, y_test,
         sheet_frames={
             "预测明细": df_out_sorted,
             "高风险名单": high_risk_df,
+            "高优先级干预名单": priority_df,
+            "观察名单": watch_df,
+            "测试集评估明细": test_detail_df,
+            "Top名单评估": topk_metrics_df,
+            "业务分层摘要": tier_summary_df,
             "结果摘要": summary_df,
         },
         percent_cols_map={
-            "预测明细": ["流失概率", "预测阈值"],
-            "高风险名单": ["流失概率", "预测阈值"],
+            "预测明细": ["流失概率", "预测阈值", "风险排名百分位"],
+            "高风险名单": ["流失概率", "预测阈值", "风险排名百分位"],
+            "高优先级干预名单": ["流失概率", "预测阈值", "风险排名百分位"],
+            "观察名单": ["流失概率", "预测阈值", "风险排名百分位"],
+            "测试集评估明细": ["流失概率", "预测阈值", "风险排名百分位"],
+            "Top名单评估": ["名单比例", "Precision", "Recall", "基准流失率", "概率截断点"],
+            "业务分层摘要": ["占比", "最高流失概率", "最低流失概率"],
             "结果摘要": ["值"],
         },
         heatmap_cols_map={
             "预测明细": ["流失概率"],
             "高风险名单": ["流失概率"],
+            "高优先级干预名单": ["流失概率"],
+            "观察名单": ["流失概率"],
+            "测试集评估明细": ["流失概率"],
+            "Top名单评估": ["Precision", "Recall", "Lift"],
         },
     )
+    logging.info(
+        "✅ Top-K名单评估已输出：%s | 分层阈值依据：%s",
+        TOPK_EVAL_RATES_TEXT,
+        tier_config["threshold_basis"],
+    )
+    logging.info(
+        "✅ 业务分层：高优先级Top %.1f%%(%s人, 阈值%.4f) | 观察名单累计Top %.1f%%(%s人, 阈值%.4f)",
+        tier_config["priority_share"] * 100,
+        tier_config["priority_count"],
+        tier_config["priority_threshold"],
+        tier_config["watch_share"] * 100,
+        tier_config["watch_count"],
+        tier_config["watch_threshold"],
+    )
     logging.info(f"✅ 员工风险预测名单已保存：{pred_save_path}")
+    output_manifest["prediction_file"] = pred_save_path
 
     # 1.1 去留预测可视化图
     decision_view_name = f"{os.path.basename(out_prefix)}_去留预测可视化.png"
@@ -2366,7 +4343,9 @@ def generate_outputs_and_reports(df_emp, model, preprocessor, X_test_df, y_test,
 
     # 2. SHAP Top3风险驱动
     if shap is not None:
-        df_out_shap = compute_shap_top3_and_export(model, preprocessor, X_test_df, df_out_sorted.copy(), out_prefix)
+        shap_detail_df = df_out_sorted.head(min(SHAP_TOP3_MAX_ROWS, len(df_out_sorted))).copy()
+        shap_feature_df = full_feature_df.loc[shap_detail_df["源数据行号"].tolist()].copy()
+        df_out_shap = compute_shap_top3_and_export(model, preprocessor, shap_feature_df, shap_detail_df, out_prefix)
         if df_out_shap is not None:
             shap_save_path = f"{out_prefix}_Top3风险驱动.xlsx"
             df_out_shap = df_out_shap.sort_values("流失概率", ascending=False).reset_index(drop=True)
@@ -2383,6 +4362,7 @@ def generate_outputs_and_reports(df_emp, model, preprocessor, X_test_df, y_test,
                 },
             )
             logging.info(f"✅ Top3风险驱动名单已保存：{shap_save_path}")
+            output_manifest["top3_driver_file"] = shap_save_path
 
     # 3. 政策缺口岗位（macro_index < 50）
     if 'macro_index' in df_emp.columns:
@@ -2397,6 +4377,7 @@ def generate_outputs_and_reports(df_emp, model, preprocessor, X_test_df, y_test,
                 }
             )
             logging.info(f"✅ 政策缺口岗位名单已保存：{gap_save_path}")
+            output_manifest["policy_gap_file"] = gap_save_path
         else:
             logging.info("ℹ️  无政策缺口岗位（所有岗位macro_index ≥ 50）")
 
@@ -2415,6 +4396,17 @@ def generate_outputs_and_reports(df_emp, model, preprocessor, X_test_df, y_test,
         },
     )
     logging.info(f"✅ 模型评估指标已保存：{metrics_save_path}")
+    output_manifest["metrics_file"] = metrics_save_path
+
+    cv_fold_metrics_path = export_cv_fold_artifacts(cv_artifacts, out_prefix=out_prefix)
+    if cv_fold_metrics_path:
+        output_manifest["cv_fold_metrics_file"] = cv_fold_metrics_path
+
+    seed_stability_path = export_seed_stability_artifacts(seed_stability_artifacts, out_prefix=out_prefix)
+    if seed_stability_path:
+        output_manifest["seed_stability_report_file"] = seed_stability_path
+
+    return output_manifest
 
 # -----------------------
 # 导出Top20特征重要性（表格）
@@ -2423,7 +4415,6 @@ def export_top20_features(model, preprocessor, save_name="feature_importance_top
     """导出Top20特征重要性表格"""
     save_path = os.path.join(CURRENT_DIR, save_name)
     try:
-        lgb_model = model.named_estimators_['lgb']
         # 获取特征名
         feature_names = []
         for name, trans, cols in preprocessor.transformers_:
@@ -2433,7 +4424,9 @@ def export_top20_features(model, preprocessor, save_name="feature_importance_top
                 ohe = trans.named_steps['ohe']
                 feature_names.extend(ohe.get_feature_names_out(cols))
         # 计算重要性并排序
-        importances = lgb_model.feature_importances_
+        importances = get_aggregated_lgb_importances(model)
+        if importances is None:
+            raise RuntimeError("未能获取LightGBM特征重要性")
         df_feat = pd.DataFrame({'特征名称': feature_names, '重要性得分': importances})
         df_feat = df_feat.sort_values('重要性得分', ascending=False).head(20)
         # 保存表格（友好版）
@@ -2453,6 +4446,8 @@ def collect_generated_files(out_prefix="employee_attrition_analysis"):
         os.path.join(CURRENT_DIR, f"{out_prefix}_Top3风险驱动.xlsx"),
         os.path.join(CURRENT_DIR, f"{out_prefix}_政策缺口岗位.xlsx"),
         os.path.join(CURRENT_DIR, f"{out_prefix}_模型评估指标.xlsx"),
+        os.path.join(CURRENT_DIR, f"{out_prefix}_5fold交叉验证明细.xlsx"),
+        os.path.join(CURRENT_DIR, f"{out_prefix}_seed_stability_report.xlsx"),
         os.path.join(CURRENT_DIR, f"{out_prefix}_shap_summary.png"),
         os.path.join(CURRENT_DIR, f"{out_prefix}_去留预测可视化.png"),
         os.path.join(CURRENT_DIR, "feature_importance_top20.xlsx"),
@@ -2475,11 +4470,19 @@ def collect_generated_files(out_prefix="employee_attrition_analysis"):
     return results
 
 
-def run_pipeline(employee_data_path=None, policy_data_path=None, output_dir=None, out_prefix="employee_attrition_analysis"):
+def run_pipeline(
+    employee_data_path=None,
+    policy_data_path=None,
+    output_dir=None,
+    out_prefix="employee_attrition_analysis",
+    enable_seed_stability=False,
+    seed_list=None,
+):
     """可复用总入口：支持脚本/网页统一调用。"""
     employee_path = os.path.abspath(employee_data_path or DATA_PATH)
     policy_path = os.path.abspath(policy_data_path or POLICY_PATH)
     runtime_dir = os.path.abspath(output_dir or CURRENT_DIR)
+    enable_seed_stability = str(enable_seed_stability).strip().lower() in {"1", "true", "yes", "on"} if isinstance(enable_seed_stability, str) else bool(enable_seed_stability)
 
     try:
         configure_runtime_paths(current_dir=runtime_dir, data_path=employee_path, policy_path=policy_path)
@@ -2493,9 +4496,16 @@ def run_pipeline(employee_data_path=None, policy_data_path=None, output_dir=None
         logging.info("员工数据：%s", DATA_PATH)
         logging.info("政策数据：%s", POLICY_PATH)
 
-        # 1. 初始化BERT模型（语义编码用）
-        logging.info("\n1. 加载BERT语义模型...")
-        tokenizer, bert_model = load_bert_model()
+        # 1. 初始化文本编码器（Sentence-BERT优先）
+        logging.info("\n1. 加载文本语义编码器...")
+        text_encoder_cfg, text_encoder_model = load_text_encoder()
+        text_encoder_info = get_text_encoder_info(text_encoder_cfg, text_encoder_model)
+        logging.info(
+            "文本编码器后端：%s | 模型：%s | device=%s",
+            text_encoder_info["backend_label"],
+            text_encoder_info["model_name"],
+            text_encoder_info.get("device", "unknown"),
+        )
 
         # 2. 加载并预处理员工数据
         logging.info("\n2. 加载并预处理员工数据...")
@@ -2504,12 +4514,12 @@ def run_pipeline(employee_data_path=None, policy_data_path=None, output_dir=None
 
         # 3. 加载政策数据并添加政策语义特征
         logging.info("\n3. 处理政策数据并生成语义特征...")
-        policy_df = prepare_policy_dataframe(POLICY_PATH, tokenizer, bert_model)
-        df_emp = add_policy_effect(df_emp, policy_df, tokenizer, bert_model)
+        policy_df = prepare_policy_dataframe(POLICY_PATH, text_encoder_cfg, text_encoder_model)
+        df_emp = add_policy_effect(df_emp, policy_df, text_encoder_cfg, text_encoder_model)
 
         # 4. 构建宏观政策指数
         logging.info("\n4. 构建宏观政策指数...")
-        policy_grouped = build_policy_macro_index_enhanced(policy_df, tokenizer, bert_model)
+        policy_grouped = build_policy_macro_index_enhanced(policy_df, text_encoder_cfg, text_encoder_model)
         if not policy_grouped.empty:
             if "JobRoleKey" in policy_grouped.columns and "JobRoleKey" in df_emp.columns:
                 df_emp = df_emp.merge(policy_grouped[["JobRoleKey", "macro_index"]], on="JobRoleKey", how="left")
@@ -2524,19 +4534,36 @@ def run_pipeline(employee_data_path=None, policy_data_path=None, output_dir=None
         logging.info("\n5. 构建数据预处理器...")
         preprocessor, num_cols, cat_cols = build_preprocessor(df_emp)
 
-        # 6. 训练Stacking模型
+        # 6. 训练模型 / Multi-Seed Ensemble
         logging.info("\n6. 训练Stacking集成模型...")
-        model, preprocessor, X_train_df, X_test_df, y_train, y_test, metrics, best_threshold = train_stacking_lgb(
-            df_emp.drop(columns=["AttritionFlag"]),  # 特征集
-            df_emp["AttritionFlag"],  # 标签集
-            preprocessor
-        )
+        seed_stability_artifacts = None
+        parsed_seed_list = parse_seed_list(seed_list) if enable_seed_stability else []
+        if enable_seed_stability:
+            model, preprocessor, X_train_df, X_test_df, y_train, y_test, metrics, best_threshold, cv_artifacts, seed_stability_artifacts = train_multi_seed_ensemble(
+                df_emp.drop(columns=["AttritionFlag"]),
+                df_emp["AttritionFlag"],
+                preprocessor,
+                seed_list=parsed_seed_list,
+                split_random_state=RANDOM_STATE,
+                run_label="multi_seed_ensemble",
+            )
+        else:
+            model, preprocessor, X_train_df, X_test_df, y_train, y_test, metrics, best_threshold, cv_artifacts = train_stacking_lgb(
+                df_emp.drop(columns=["AttritionFlag"]),  # 特征集
+                df_emp["AttritionFlag"],  # 标签集
+                preprocessor,
+                random_state=RANDOM_STATE,
+                run_label="primary",
+            )
 
         # 7. 生成所有输出文件
         logging.info("\n7. 生成结果报告与文件...")
-        generate_outputs_and_reports(
+        output_manifest = generate_outputs_and_reports(
             df_emp, model, preprocessor, X_test_df, y_test, metrics,
-            threshold=best_threshold, out_prefix=out_prefix
+            threshold=best_threshold,
+            out_prefix=out_prefix,
+            cv_artifacts=cv_artifacts,
+            seed_stability_artifacts=seed_stability_artifacts,
         )
         export_top20_features(model, preprocessor)
 
@@ -2547,10 +4574,11 @@ def run_pipeline(employee_data_path=None, policy_data_path=None, output_dir=None
         # 特征重要性图
         plot_feature_importance(model, preprocessor)
         # 风险分布直方图
-        y_pred_prob = model.predict_proba(preprocessor.transform(X_test_df))[:, 1]
+        X_all_df = df_emp.drop(columns=["AttritionFlag"], errors="ignore")
+        y_pred_prob = model.predict_proba(preprocessor.transform(X_all_df))[:, 1]
         plot_attrition_risk_distribution(y_pred_prob, threshold=best_threshold)
         # 政策-岗位匹配图
-        total_policy_score, policy_post_mapping, _ = compute_policy_impact(policy_df, tokenizer, bert_model)
+        total_policy_score, policy_post_mapping, _ = compute_policy_impact(policy_df, text_encoder_cfg, text_encoder_model)
         plot_policy_job_matching(policy_post_mapping)
 
         output_files = collect_generated_files(out_prefix=out_prefix)
@@ -2564,9 +4592,17 @@ def run_pipeline(employee_data_path=None, policy_data_path=None, output_dir=None
             "threshold_strategy": best_threshold,
             "output_dir": CURRENT_DIR,
             "output_files": output_files,
+            "artifact_paths": output_manifest,
             "out_prefix": out_prefix,
             "employee_rows": int(len(df_emp)),
             "policy_rows": int(len(policy_df)),
+            "text_embedding_backend": text_encoder_info["backend_label"],
+            "text_encoder_model_name": text_encoder_info["model_name"],
+            "text_encoder_device": text_encoder_info.get("device", "unknown"),
+            "seed_stability_enabled": bool(enable_seed_stability),
+            "multi_seed_ensemble_enabled": bool(enable_seed_stability),
+            "seed_list_used": parsed_seed_list,
+            "seed_stability_overview": seed_stability_artifacts.get("overview", {}) if seed_stability_artifacts else {},
         }
     except SystemExit as exc:
         raise RuntimeError("流程执行被中止，请检查输入文件和运行依赖。") from exc

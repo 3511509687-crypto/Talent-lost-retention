@@ -1,0 +1,61 @@
+# Python bytecode and test caches
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.pycache_check/
+
+# Local IDE/editor settings
+.idea/
+.vscode/
+
+# Local runtime, dependency, and model caches
+model_cache/
+model_outputs/
+pip_tmp/
+python_cuda_packages/
+runtime_tmp/
+models/temp_joblib/
+
+# Logs
+*.log
+flask_*.log
+
+# Generated model reports and charts
+result预测结果.xlsx
+models/employee_attrition_analysis_*.xlsx
+models/employee_attrition_analysis_*.png
+models/employee_attrition_analysis_*.csv
+models/employee_attrition_analysis_*.json
+models/employee_attrition_analysis_*.html
+models/employee_attrition_analysis_*.txt
+models/*policy_crawl*
+models/*debug_page.html
+models/*network_urls.txt
+models/feature_importance*.xlsx
+models/feature_importance*.png
+models/model*.png
+models/policy_job_matching.png
+models/attrition_decision_view.png
+models/attrition_risk_distribution.png
+models/*_预测结果.xlsx
+models/*_模型评估指标.xlsx
+models/*_Top3风险驱动.xlsx
+models/*_5fold交叉验证明细.xlsx
+models/*_政策缺口岗位.xlsx
+models/*_去留预测可视化.png
+models/*_shap_summary.png
+
+# Runtime upload copies; keep curated raw/processed datasets under uploads/
+uploads/employee/20*_*.csv
+uploads/policy/20*_*.xlsx
+
+# Local legacy snapshots are not part of the GitHub-ready source tree
+legacy_versions/
+
+# PPT artifacts removed from this project
+ppt_work/
+pptx_extract_*/
+*.ppt
+*.pptx
+*.pptm

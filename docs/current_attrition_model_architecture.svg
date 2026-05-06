@@ -1,0 +1,199 @@
+<svg width="2400" height="920" viewBox="0 0 2400 920" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="bg" x1="30" y1="30" x2="2370" y2="890" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#F5FAFF"/>
+      <stop offset="0.55" stop-color="#FCFEFF"/>
+      <stop offset="1" stop-color="#FFF9F1"/>
+    </linearGradient>
+    <linearGradient id="titleBar" x1="0" y1="0" x2="1" y2="1">
+      <stop stop-color="#133D74"/>
+      <stop offset="1" stop-color="#2B6FB8"/>
+    </linearGradient>
+    <linearGradient id="blueBox" x1="0" y1="0" x2="1" y2="1">
+      <stop stop-color="#EEF6FF"/>
+      <stop offset="1" stop-color="#FFFFFF"/>
+    </linearGradient>
+    <linearGradient id="greenBox" x1="0" y1="0" x2="1" y2="1">
+      <stop stop-color="#EEFCF5"/>
+      <stop offset="1" stop-color="#FFFFFF"/>
+    </linearGradient>
+    <linearGradient id="goldBox" x1="0" y1="0" x2="1" y2="1">
+      <stop stop-color="#FFF7E8"/>
+      <stop offset="1" stop-color="#FFFFFF"/>
+    </linearGradient>
+    <linearGradient id="roseBox" x1="0" y1="0" x2="1" y2="1">
+      <stop stop-color="#FFF1F2"/>
+      <stop offset="1" stop-color="#FFFFFF"/>
+    </linearGradient>
+    <filter id="shadow" x="-18%" y="-18%" width="150%" height="170%">
+      <feDropShadow dx="0" dy="12" stdDeviation="14" flood-color="#7F97B2" flood-opacity="0.14"/>
+    </filter>
+    <marker id="arrowBlue" viewBox="0 0 12 12" refX="10" refY="6" markerWidth="12" markerHeight="12" orient="auto-start-reverse">
+      <path d="M0 0L12 6L0 12V0Z" fill="#4D77B7"/>
+    </marker>
+    <marker id="arrowRed" viewBox="0 0 12 12" refX="10" refY="6" markerWidth="12" markerHeight="12" orient="auto-start-reverse">
+      <path d="M0 0L12 6L0 12V0Z" fill="#B45B60"/>
+    </marker>
+    <style>
+      text {
+        font-family: "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+      }
+      .title {
+        font-size: 34px;
+        font-weight: 700;
+        fill: #FDFEFF;
+      }
+      .subtitle {
+        font-size: 15px;
+        font-weight: 500;
+        fill: #DCEAFF;
+      }
+      .legend {
+        font-size: 12px;
+        font-weight: 600;
+        fill: #EEF6FF;
+      }
+      .step {
+        font-size: 14px;
+        font-weight: 700;
+        fill: #4A657F;
+      }
+      .boxTitle {
+        font-size: 20px;
+        font-weight: 700;
+        fill: #16314C;
+      }
+      .boxBody {
+        font-size: 14px;
+        font-weight: 500;
+        fill: #4C657D;
+      }
+      .boxNote {
+        font-size: 12px;
+        font-weight: 700;
+        fill: #60748A;
+      }
+      .chip {
+        font-size: 12px;
+        font-weight: 700;
+        fill: #294C73;
+      }
+      .chipPurple {
+        font-size: 12px;
+        font-weight: 700;
+        fill: #4F377C;
+      }
+      .footer {
+        font-size: 12px;
+        font-weight: 700;
+        fill: #617287;
+      }
+    </style>
+  </defs>
+
+  <rect x="20" y="20" width="2360" height="880" rx="32" fill="url(#bg)"/>
+
+  <rect x="48" y="40" width="2304" height="108" rx="28" fill="url(#titleBar)" filter="url(#shadow)"/>
+  <text x="84" y="86" class="title">Current Attrition Model Architecture</text>
+  <text x="84" y="116" class="subtitle">Clean left-to-right view of the current pipeline in models/v3_1_blue.py</text>
+
+  <rect x="1890" y="66" width="428" height="58" rx="16" fill="#FFFFFF" fill-opacity="0.12" stroke="#D8E7F9" stroke-opacity="0.35"/>
+  <line x1="1918" y1="88" x2="1976" y2="88" stroke="#E6F1FF" stroke-width="3" marker-end="url(#arrowBlue)"/>
+  <text x="1990" y="93" class="legend">solid = default runtime path</text>
+  <line x1="1918" y1="108" x2="1976" y2="108" stroke="#E6F1FF" stroke-width="3" stroke-dasharray="8 6" marker-end="url(#arrowBlue)"/>
+  <text x="1990" y="113" class="legend">dashed = optional multi-seed path</text>
+
+  <text x="86" y="330" class="step">Step 1</text>
+  <text x="466" y="210" class="step">Step 2A</text>
+  <text x="466" y="556" class="step">Step 2B</text>
+  <text x="930" y="330" class="step">Step 3</text>
+  <text x="1406" y="330" class="step">Step 4</text>
+  <text x="1876" y="330" class="step">Step 5</text>
+
+  <g filter="url(#shadow)">
+    <rect x="60" y="350" width="300" height="150" rx="24" fill="url(#blueBox)" stroke="#C7DCF5" stroke-width="2"/>
+    <rect x="60" y="350" width="300" height="12" rx="24" fill="#6CA8E6"/>
+    <text x="88" y="398" class="boxTitle">1. Input Data</text>
+    <text x="88" y="432" class="boxBody">
+      <tspan x="88" dy="0">Employee CSV or uploaded file</tspan>
+      <tspan x="88" dy="24">Policy XLSX or crawler output</tspan>
+      <tspan x="88" dy="24">Start of the shared modeling flow</tspan>
+    </text>
+
+    <rect x="440" y="230" width="330" height="160" rx="24" fill="url(#greenBox)" stroke="#CBE8D7" stroke-width="2"/>
+    <rect x="440" y="230" width="330" height="12" rx="24" fill="#54BA83"/>
+    <text x="468" y="278" class="boxTitle">2A. Employee Features</text>
+    <text x="468" y="312" class="boxBody">
+      <tspan x="468" dy="0">HR raw fields and engineered signals</tspan>
+      <tspan x="468" dy="24">StressLoadScore, promotion wait,</tspan>
+      <tspan x="468" dy="24">role stagnation, risk bands</tspan>
+    </text>
+    <text x="468" y="366" class="boxNote">Employee-side attrition signal</text>
+
+    <rect x="440" y="580" width="330" height="170" rx="24" fill="url(#greenBox)" stroke="#CBE8D7" stroke-width="2"/>
+    <rect x="440" y="580" width="330" height="12" rx="24" fill="#54BA83"/>
+    <text x="468" y="628" class="boxTitle">2B. Policy Semantics</text>
+    <text x="468" y="662" class="boxBody">
+      <tspan x="468" dy="0">Embeddings, topics, sentiment, time weight</tspan>
+      <tspan x="468" dy="24">Policy matching with role and department bonus</tspan>
+      <tspan x="468" dy="24">Output: net_support, exposure, macro_index</tspan>
+    </text>
+    <text x="468" y="726" class="boxNote">Text is compressed into tabular policy features</text>
+
+    <rect x="900" y="350" width="340" height="150" rx="24" fill="url(#goldBox)" stroke="#E8CF99" stroke-width="2"/>
+    <rect x="900" y="350" width="340" height="12" rx="24" fill="#E6B04F"/>
+    <text x="928" y="398" class="boxTitle">3. Merge + Preprocess</text>
+    <text x="928" y="432" class="boxBody">
+      <tspan x="928" dy="0">Combine employee and policy features</tspan>
+      <tspan x="928" dy="24">num: median -&gt; scale</tspan>
+      <tspan x="928" dy="24">cat: mode -&gt; one-hot</tspan>
+    </text>
+
+    <rect x="1360" y="350" width="360" height="180" rx="24" fill="url(#goldBox)" stroke="#E8CF99" stroke-width="2"/>
+    <rect x="1360" y="350" width="360" height="12" rx="24" fill="#E6B04F"/>
+    <text x="1388" y="398" class="boxTitle">4. Ensemble Stack</text>
+    <text x="1388" y="432" class="boxBody">
+      <tspan x="1388" dy="0">Base models: LightGBM, LR, ExtraTrees</tspan>
+      <tspan x="1388" dy="24">5-fold OOF blend search and threshold search</tspan>
+      <tspan x="1388" dy="24">Meta features plus Meta LR</tspan>
+    </text>
+    <rect x="1388" y="480" width="82" height="28" rx="14" fill="#FFF0CD" stroke="#EDC16A"/>
+    <rect x="1482" y="480" width="78" height="28" rx="14" fill="#FFF0CD" stroke="#EDC16A"/>
+    <rect x="1572" y="480" width="82" height="28" rx="14" fill="#FFF0CD" stroke="#EDC16A"/>
+    <text x="1416" y="499" class="chip">LGB</text>
+    <text x="1508" y="499" class="chip">LR</text>
+    <text x="1594" y="499" class="chip">ET</text>
+
+    <rect x="1830" y="350" width="360" height="180" rx="24" fill="url(#roseBox)" stroke="#E8B7BB" stroke-width="2"/>
+    <rect x="1830" y="350" width="360" height="12" rx="24" fill="#D96F78"/>
+    <text x="1858" y="398" class="boxTitle">5. Decision + Outputs</text>
+    <text x="1858" y="432" class="boxBody">
+      <tspan x="1858" dy="0">Final probability path from the stack</tspan>
+      <tspan x="1858" dy="24">Segment thresholds: high_risk vs standard</tspan>
+      <tspan x="1858" dy="24">Workbook, SHAP, drivers, metrics, charts</tspan>
+    </text>
+    <text x="1858" y="506" class="boxNote">Current model uses segment-aware final decisions</text>
+
+    <rect x="1360" y="640" width="360" height="110" rx="24" fill="#F8F3FF" stroke="#A690E2" stroke-width="2.5" stroke-dasharray="10 8"/>
+    <text x="1388" y="684" class="boxTitle">Optional: MultiSeedEnsemble</text>
+    <text x="1388" y="714" class="boxBody">
+      <tspan x="1388" dy="0">Train several full stacks and average seed probabilities</tspan>
+    </text>
+    <rect x="1388" y="724" width="84" height="26" rx="13" fill="#FFFFFF" stroke="#BCA9EE"/>
+    <rect x="1484" y="724" width="84" height="26" rx="13" fill="#FFFFFF" stroke="#BCA9EE"/>
+    <rect x="1580" y="724" width="84" height="26" rx="13" fill="#FFFFFF" stroke="#BCA9EE"/>
+    <text x="1408" y="742" class="chipPurple">Seed 13</text>
+    <text x="1504" y="742" class="chipPurple">Seed 21</text>
+    <text x="1600" y="742" class="chipPurple">Seed 42+</text>
+  </g>
+
+  <path d="M360 390H396V310H440" stroke="#4D77B7" stroke-width="4" marker-end="url(#arrowBlue)"/>
+  <path d="M360 460H396V665H440" stroke="#4D77B7" stroke-width="4" marker-end="url(#arrowBlue)"/>
+  <path d="M770 310H820V395H900" stroke="#4D77B7" stroke-width="4" marker-end="url(#arrowBlue)"/>
+  <path d="M770 665H820V455H900" stroke="#4D77B7" stroke-width="4" marker-end="url(#arrowBlue)"/>
+  <path d="M1240 425H1360" stroke="#4D77B7" stroke-width="4" marker-end="url(#arrowBlue)"/>
+  <path d="M1720 425H1830" stroke="#B45B60" stroke-width="4" marker-end="url(#arrowRed)"/>
+  <path d="M1720 695H1772V530H1830" stroke="#8C73D7" stroke-width="4" stroke-dasharray="8 6" marker-end="url(#arrowBlue)"/>
+
+  <text x="60" y="858" class="footer">Code anchors: run_pipeline(3754), train_stacking_lgb(2421), train_multi_seed_ensemble(2831), BlendedAttritionModel(2210), MultiSeedEnsembleModel(2242)</text>
+</svg>

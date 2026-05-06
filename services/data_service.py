@@ -184,7 +184,7 @@ def get_data_source_info() -> dict:
         "is_legacy": is_legacy,
         "is_generated": is_generated,
         "source_type": source_type,
-        "label": "新模型输出结果" if is_generated else "旧版静态结果表",
+        "label": "New Model Output" if is_generated else "Legacy Static Workbook",
     }
 
 
