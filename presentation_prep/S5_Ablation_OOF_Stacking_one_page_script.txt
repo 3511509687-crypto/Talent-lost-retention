@@ -1,0 +1,9 @@
+S4 showed that LightGBM is strong. This slide checks whether the final system is really justified.
+
+We validate it in two ways. First, ablation study: we remove or replace one component, such as TF-IDF versus Sentence-BERT, or LR, ET and LightGBM, and then compare the change in performance. This tells us which modules contribute to the final result, instead of only reporting a high score.
+
+Second, we use OOF stacking. OOF means out-of-fold: every training sample receives a prediction from a model that did not train on that sample. These fair predictions are then used by a logistic meta learner to combine LR, ET and LightGBM. This is better than simple average because different models are reliable in different cases, and disagreement itself is useful information.
+
+The evidence is stable. Our full model reaches OOF AUC 0.9793 and Test AUC 0.9847, with only a 0.0054 gap. It also reaches Test F1 0.9248.
+
+For HR action, the Top 20 percent risk list has Precision 0.9700, Recall 0.8151 and Lift 4.0756. So the model does not only predict attrition; it produces a focused action list. Next, SHAP explains why each employee is flagged.

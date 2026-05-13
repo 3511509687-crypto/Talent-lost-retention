@@ -28,8 +28,17 @@ class DummyModel:
 
 def test_prediction_export_uses_full_employee_frame():
     saved_workbooks = {}
+    plotted_r2_payloads = []
     old_save = model_module.save_friendly_excel
     old_plot = model_module.plot_attrition_decision_view
+    old_r2_plot = getattr(model_module, "plot_probability_r2_fit", None)
+    old_binned_plot = model_module.plot_binned_actual_vs_predicted
+    old_classification_plot = model_module.plot_classification_diagnostics
+    old_sigmoid_plot = model_module.plot_lr_sigmoid_curve
+    old_lr_coefficients_plot = model_module.plot_lr_coefficients
+    old_lgb_gain_plot = model_module.plot_lgb_gain_importance
+    old_et_lgb_plot = model_module.plot_et_lgb_feature_importance_comparison
+    old_lgb_training_plot = model_module.plot_lgb_training_curves
     old_cv = model_module.export_cv_fold_artifacts
     old_seed = model_module.export_seed_stability_artifacts
     old_shap = model_module.shap
@@ -37,9 +46,20 @@ def test_prediction_export_uses_full_employee_frame():
     def fake_save(path, sheet_frames, **_kwargs):
         saved_workbooks[path] = sheet_frames
 
+    def fake_r2_plot(y_true, y_prob, **kwargs):
+        plotted_r2_payloads.append((list(y_true), list(y_prob), kwargs))
+
     try:
         model_module.save_friendly_excel = fake_save
         model_module.plot_attrition_decision_view = lambda *_args, **_kwargs: None
+        model_module.plot_probability_r2_fit = fake_r2_plot
+        model_module.plot_binned_actual_vs_predicted = lambda *_args, **_kwargs: None
+        model_module.plot_classification_diagnostics = lambda *_args, **_kwargs: None
+        model_module.plot_lr_sigmoid_curve = lambda *_args, **_kwargs: None
+        model_module.plot_lr_coefficients = lambda *_args, **_kwargs: None
+        model_module.plot_lgb_gain_importance = lambda *_args, **_kwargs: None
+        model_module.plot_et_lgb_feature_importance_comparison = lambda *_args, **_kwargs: None
+        model_module.plot_lgb_training_curves = lambda *_args, **_kwargs: None
         model_module.export_cv_fold_artifacts = lambda *_args, **_kwargs: None
         model_module.export_seed_stability_artifacts = lambda *_args, **_kwargs: None
         model_module.shap = None
@@ -69,6 +89,17 @@ def test_prediction_export_uses_full_employee_frame():
     finally:
         model_module.save_friendly_excel = old_save
         model_module.plot_attrition_decision_view = old_plot
+        if old_r2_plot is not None:
+            model_module.plot_probability_r2_fit = old_r2_plot
+        else:
+            delattr(model_module, "plot_probability_r2_fit")
+        model_module.plot_binned_actual_vs_predicted = old_binned_plot
+        model_module.plot_classification_diagnostics = old_classification_plot
+        model_module.plot_lr_sigmoid_curve = old_sigmoid_plot
+        model_module.plot_lr_coefficients = old_lr_coefficients_plot
+        model_module.plot_lgb_gain_importance = old_lgb_gain_plot
+        model_module.plot_et_lgb_feature_importance_comparison = old_et_lgb_plot
+        model_module.plot_lgb_training_curves = old_lgb_training_plot
         model_module.export_cv_fold_artifacts = old_cv
         model_module.export_seed_stability_artifacts = old_seed
         model_module.shap = old_shap
@@ -81,9 +112,93 @@ def test_prediction_export_uses_full_employee_frame():
     assert len(prediction_frames["预测明细"]) == 4
     assert len(prediction_frames["测试集评估明细"]) == 2
     assert "Top名单评估" in prediction_frames
+    assert "分箱实际预测对比" in prediction_frames
     assert "名单层级" in prediction_frames["预测明细"].columns
     assert "高优先级干预名单" in prediction_frames
     assert "观察名单" in prediction_frames
+    assert plotted_r2_payloads
+    assert plotted_r2_payloads[0][0] == [1, 1]
+    assert plotted_r2_payloads[0][2]["metric_prefix"] == "test"
+
+
+def test_report_generation_continues_when_shap_runs_out_of_memory():
+    saved_workbooks = {}
+    old_save = model_module.save_friendly_excel
+    old_plot = model_module.plot_attrition_decision_view
+    old_r2_plot = model_module.plot_probability_r2_fit
+    old_binned_plot = model_module.plot_binned_actual_vs_predicted
+    old_classification_plot = model_module.plot_classification_diagnostics
+    old_sigmoid_plot = model_module.plot_lr_sigmoid_curve
+    old_lr_coefficients_plot = model_module.plot_lr_coefficients
+    old_lgb_gain_plot = model_module.plot_lgb_gain_importance
+    old_et_lgb_plot = model_module.plot_et_lgb_feature_importance_comparison
+    old_lgb_training_plot = model_module.plot_lgb_training_curves
+    old_cv = model_module.export_cv_fold_artifacts
+    old_seed = model_module.export_seed_stability_artifacts
+    old_shap = model_module.shap
+    old_compute_shap = model_module.compute_shap_top3_and_export
+
+    def fake_save(path, sheet_frames, **_kwargs):
+        saved_workbooks[str(path)] = sheet_frames
+
+    def raise_memory_error(*_args, **_kwargs):
+        raise MemoryError("simulated shap oom")
+
+    try:
+        model_module.save_friendly_excel = fake_save
+        model_module.plot_attrition_decision_view = lambda *_args, **_kwargs: None
+        model_module.plot_probability_r2_fit = lambda *_args, **_kwargs: None
+        model_module.plot_binned_actual_vs_predicted = lambda *_args, **_kwargs: None
+        model_module.plot_classification_diagnostics = lambda *_args, **_kwargs: None
+        model_module.plot_lr_sigmoid_curve = lambda *_args, **_kwargs: None
+        model_module.plot_lr_coefficients = lambda *_args, **_kwargs: None
+        model_module.plot_lgb_gain_importance = lambda *_args, **_kwargs: None
+        model_module.plot_et_lgb_feature_importance_comparison = lambda *_args, **_kwargs: None
+        model_module.plot_lgb_training_curves = lambda *_args, **_kwargs: None
+        model_module.export_cv_fold_artifacts = lambda *_args, **_kwargs: None
+        model_module.export_seed_stability_artifacts = lambda *_args, **_kwargs: None
+        model_module.shap = object()
+        model_module.compute_shap_top3_and_export = raise_memory_error
+
+        df_emp = pd.DataFrame(
+            {
+                "Age": [25, 31, 42, 36],
+                "Department": ["Sales", "Sales", "Human Resources", "Research & Development"],
+                "JobRole": ["Sales Executive", "Sales Representative", "Human Resources", "Research Scientist"],
+                "AttritionFlag": [0, 1, 0, 1],
+            }
+        )
+        X_test_df = df_emp.drop(columns=["AttritionFlag"]).iloc[[1, 3]].copy()
+        y_test = df_emp["AttritionFlag"].iloc[[1, 3]]
+
+        model_module.generate_outputs_and_reports(
+            df_emp=df_emp,
+            model=DummyModel(),
+            preprocessor=DummyPreprocessor(),
+            X_test_df=X_test_df,
+            y_test=y_test,
+            metrics={},
+            threshold=0.5,
+            out_prefix="unit_test_shap_oom",
+        )
+    finally:
+        model_module.save_friendly_excel = old_save
+        model_module.plot_attrition_decision_view = old_plot
+        model_module.plot_probability_r2_fit = old_r2_plot
+        model_module.plot_binned_actual_vs_predicted = old_binned_plot
+        model_module.plot_classification_diagnostics = old_classification_plot
+        model_module.plot_lr_sigmoid_curve = old_sigmoid_plot
+        model_module.plot_lr_coefficients = old_lr_coefficients_plot
+        model_module.plot_lgb_gain_importance = old_lgb_gain_plot
+        model_module.plot_et_lgb_feature_importance_comparison = old_et_lgb_plot
+        model_module.plot_lgb_training_curves = old_lgb_training_plot
+        model_module.export_cv_fold_artifacts = old_cv
+        model_module.export_seed_stability_artifacts = old_seed
+        model_module.shap = old_shap
+        model_module.compute_shap_top3_and_export = old_compute_shap
+
+    assert any(path.endswith("_预测结果.xlsx") for path in saved_workbooks)
+    assert any(path.endswith("_模型评估指标.xlsx") for path in saved_workbooks)
 
 
 def test_policy_candidate_filter_rejects_weak_macro_policy():
@@ -168,6 +283,32 @@ def test_topk_metrics_frame_calculates_precision_recall_and_lift():
     assert round(top20["Lift"], 4) == 1.6667
 
 
+def test_actual_vs_predicted_bin_frame_compares_mean_probability_to_actual_rate():
+    y_true = np.array([0, 0, 0, 1, 0, 1, 1, 1, 1, 1], dtype=int)
+    y_prob = np.array([0.05, 0.10, 0.20, 0.30, 0.40, 0.55, 0.70, 0.80, 0.90, 0.95], dtype=float)
+
+    frame = model_module.build_actual_vs_predicted_bin_frame(y_true, y_prob, n_bins=5)
+
+    assert list(frame["risk_bin"]) == [1, 2, 3, 4, 5]
+    assert list(frame["sample_count"]) == [2, 2, 2, 2, 2]
+    assert round(frame.iloc[0]["mean_predicted_probability"], 4) == 0.075
+    assert round(frame.iloc[0]["actual_attrition_rate"], 4) == 0.0
+    assert round(frame.iloc[-1]["mean_predicted_probability"], 4) == 0.925
+    assert round(frame.iloc[-1]["actual_attrition_rate"], 4) == 1.0
+
+
+def test_actual_vs_predicted_bin_frame_defaults_to_twenty_bins():
+    y_true = np.tile([0, 1], 60).astype(int)
+    y_prob = np.linspace(0.001, 0.999, 100, dtype=float)
+
+    frame = model_module.build_actual_vs_predicted_bin_frame(y_true[:100], y_prob)
+
+    assert len(frame) == 20
+    assert frame.iloc[0]["risk_bin_label"] == "B1"
+    assert frame.iloc[-1]["risk_bin_label"] == "B20"
+    assert frame["sample_count"].sum() == 100
+
+
 def test_business_tiers_are_rank_sized_and_traceable():
     detail_df = pd.DataFrame({"流失概率": np.linspace(1.0, 0.01, 100)})
     tiered_df, tier_summary_df, tier_config = model_module.apply_business_tiers(
@@ -197,35 +338,93 @@ def test_generalization_diagnostics_uses_oof_test_gap_for_warning():
     assert diagnostics["generalization_warning"] == "OK"
 
 
-def test_default_input_resolver_prefers_latest_processed_file():
+def test_probability_regression_metrics_calculate_r2_rmse_and_brier():
+    y_true = np.array([0, 1, 1, 0], dtype=int)
+    y_prob = np.array([0.1, 0.8, 0.6, 0.3], dtype=float)
+
+    metrics = model_module.evaluate_probability_regression_metrics(y_true, y_prob)
+
+    assert round(metrics["r2"], 4) == 0.7
+    assert round(metrics["rmse"], 4) == 0.2739
+    assert round(metrics["mae"], 4) == 0.25
+    assert round(metrics["brier_score"], 4) == 0.075
+
+
+def test_metrics_export_frames_include_probability_regression_metrics():
+    core_df, full_df = model_module.build_metrics_export_frames(
+        {
+            "train_probability_r2": 0.71,
+            "valid_probability_r2": 0.62,
+            "test_probability_r2": 0.58,
+            "train_probability_rmse": 0.23,
+            "valid_probability_rmse": 0.28,
+            "test_probability_rmse": 0.31,
+            "test_probability_brier_score": 0.0961,
+        }
+    )
+
+    assert "test_probability_r2" in set(core_df["指标代码"])
+    assert "test_probability_rmse" in set(core_df["指标代码"])
+    assert "test_probability_brier_score" in set(full_df["指标代码"])
+    assert "测试集概率R方" in set(core_df["指标名称"])
+    assert "测试集概率RMSE" in set(core_df["指标名称"])
+
+
+def test_default_input_resolver_prefers_preferred_processed_file_before_latest():
     with tempfile.TemporaryDirectory() as temp_dir:
         base_dir = Path(temp_dir)
         processed_dir = base_dir / "processed"
         processed_dir.mkdir()
         fallback_path = base_dir / "fallback.csv"
         fallback_path.write_text("fallback", encoding="utf-8")
-        older_path = processed_dir / "20240101_employee_standardized.csv"
-        newer_path = processed_dir / "20240102_employee_standardized.csv"
-        older_path.write_text("older", encoding="utf-8")
-        newer_path.write_text("newer", encoding="utf-8")
+        clean_hr_path = processed_dir / "20240101_clean_hr_comma_sep_14999_standardized.csv"
+        clean_external_path = processed_dir / "20240102_clean_external_sources_standardized.csv"
+        newer_external_path = processed_dir / "20240103_external_sources_standardized.csv"
+        clean_hr_path.write_text("clean hr", encoding="utf-8")
+        clean_external_path.write_text("clean external", encoding="utf-8")
+        newer_external_path.write_text("newer external", encoding="utf-8")
 
         resolved = model_module.resolve_default_input_path(
             processed_dir,
             ("*_standardized.csv", "*.csv"),
             fallback_path,
+            preferred_patterns=model_module.PREFERRED_EMPLOYEE_INPUT_PATTERNS,
         )
 
-    assert Path(resolved).name == newer_path.name
+    assert Path(resolved).name == clean_hr_path.name
+
+
+def test_employee_input_quality_guard_rejects_bad_external_sources():
+    bad_df = pd.DataFrame({
+        "Attrition": ["No"] * 6,
+        "JobRole": [np.nan] * 6,
+    })
+
+    try:
+        model_module.validate_employee_input_quality(
+            bad_df,
+            source_path="20240101_external_sources_standardized.csv",
+            min_external_rows=5,
+        )
+    except ValueError as exc:
+        assert "疑似旧坏合并数据" in str(exc)
+    else:
+        raise AssertionError("bad external_sources data should be rejected")
 
 
 if __name__ == "__main__":
     test_prediction_export_uses_full_employee_frame()
+    test_report_generation_continues_when_shap_runs_out_of_memory()
     test_policy_candidate_filter_rejects_weak_macro_policy()
     test_policy_candidate_filter_keeps_talent_policy()
     test_risk_segment_labels_are_capped_to_business_sized_group()
     test_segment_threshold_optimization_controls_predicted_positive_rate()
     test_target_positive_rate_defaults_to_recall_oriented_large_list()
     test_topk_metrics_frame_calculates_precision_recall_and_lift()
+    test_actual_vs_predicted_bin_frame_compares_mean_probability_to_actual_rate()
     test_business_tiers_are_rank_sized_and_traceable()
     test_generalization_diagnostics_uses_oof_test_gap_for_warning()
-    test_default_input_resolver_prefers_latest_processed_file()
+    test_probability_regression_metrics_calculate_r2_rmse_and_brier()
+    test_metrics_export_frames_include_probability_regression_metrics()
+    test_default_input_resolver_prefers_preferred_processed_file_before_latest()
+    test_employee_input_quality_guard_rejects_bad_external_sources()

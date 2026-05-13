@@ -1,0 +1,11 @@
+Slide 1.
+S4 showed that LightGBM is strong. My section asks a validation question: how do we know the final model is not just a random stack of algorithms? We answer this with ablation, OOF stacking, and HR ranking.
+
+Slide 2.
+Ablation means removing or replacing one component and checking the performance change. We compare TF-IDF with Sentence-BERT, test LR, ET and LightGBM separately, and test the full model without key components. This proves contribution, not only final performance.
+
+Slide 3.
+OOF means out-of-fold. Each training sample receives a prediction from a model that did not train on that sample. These fair predictions become inputs for the meta learner. This is better than simple average because LR, ET and LightGBM are reliable in different situations, and disagreement itself is useful.
+
+Slide 4.
+The full model reaches OOF AUC 0.9793 and Test AUC 0.9847, with only a 0.0054 gap. For HR action, the Top 20 percent list reaches Precision 0.9700, Recall 0.8151, and Lift 4.0756. So the model produces a focused action list. Next, SHAP explains why each employee is flagged.

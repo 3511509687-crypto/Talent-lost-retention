@@ -1,0 +1,11 @@
+Slide 1.
+S4 established LightGBM as a strong nonlinear predictor. This section presents the validation logic behind the final ensemble. The design is supported by ablation analysis, out-of-fold stacking, and HR-oriented ranking evaluation.
+
+Slide 2.
+Ablation analysis removes or replaces one component and then measures the resulting performance change. We compare TF-IDF with Sentence-BERT, evaluate LR, ET and LightGBM separately, and test full-model variants without key components. This provides component-level evidence rather than only reporting the best final score.
+
+Slide 3.
+OOF means out-of-fold. Each training sample receives a prediction from a model that did not train on that sample. These leakage-controlled predictions become inputs for the logistic meta learner. Compared with simple averaging, stacking can assign different reliability to LR, ET and LightGBM, while also using disagreement as uncertainty information.
+
+Slide 4.
+The full model reaches OOF AUC 0.9793 and Test AUC 0.9847, with only a 0.0054 gap. For HR action, the Top 20 percent risk group reaches Precision 0.9700, Recall 0.8151, and Lift 4.0756. The model therefore produces a focused intervention list. The next section uses SHAP to explain individual risk drivers.

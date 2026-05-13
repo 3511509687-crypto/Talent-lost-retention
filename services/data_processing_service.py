@@ -666,11 +666,21 @@ def _first_non_empty(*values) -> str:
 
 
 def _normalize_yes_no(value, default: str = "No") -> str:
+    try:
+        numeric = float(value)
+        if np.isfinite(numeric):
+            if numeric == 1.0:
+                return "Yes"
+            if numeric == 0.0:
+                return "No"
+    except Exception:
+        pass
+
     token = _normalize_token(value)
     if not token:
         return default
-    yes_tokens = {"1", "y", "yes", "true", "是", "离职", "已离职", "加班", "需要", "有"}
-    no_tokens = {"0", "n", "no", "false", "否", "未离职", "在职", "不加班", "无", "没有"}
+    yes_tokens = {"1", "y", "yes", "true", "left", "是", "离职", "已离职", "加班", "需要", "有"}
+    no_tokens = {"0", "n", "no", "false", "stay", "stayed", "否", "未离职", "在职", "不加班", "无", "没有"}
     if token in no_tokens or "no" in token or "在职" in token or "不离职" in token:
         return "No"
     if token in yes_tokens or "yes" in token or "离职" in token:

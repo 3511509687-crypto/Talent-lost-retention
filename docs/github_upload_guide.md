@@ -1,11 +1,11 @@
 # GitHub Upload Guide
 
-This guide assumes the local project root is `F:\app_bundle`.
+Run the commands from the project root after cloning or opening this repository locally.
 
 ## 1. Review The Working Tree
 
 ```powershell
-cd F:\app_bundle
+cd path/to/your/project
 git status --short --ignored
 ```
 

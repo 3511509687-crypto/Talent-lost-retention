@@ -1,0 +1,17 @@
+S5 Ablation + OOF Stacking speaker script, target about 2:05-2:15
+
+S4 showed that LightGBM is strong. My section asks the validation question: how do we prove our final model is not just a random stack of algorithms?
+
+We use two methods: ablation study and OOF stacking.
+
+Ablation study means removing or replacing one part of the pipeline and checking what changes. We compare TF-IDF with Sentence-BERT, test LR, ET and LightGBM separately, and also test the full model without key components. This shows each module's contribution, not only the final score.
+
+OOF means out-of-fold. Each training sample receives a prediction from a model that did not see it during training. These fair predictions become inputs to the second-level model, or meta learner. The meta learner learns how to combine LR, ET and LightGBM.
+
+Why not simple average? Simple average gives every model equal trust. But these models are reliable in different situations. Our stacker uses each model's probability, the weighted blend, the mean, the spread, and model disagreement.
+
+The evidence supports this design. The full model reaches OOF AUC 0.979347 and Test AUC 0.984701. The gap is only 0.005354, so the internal validation is stable. It also reaches Test Precision 0.945827, Recall 0.904762 and F1 0.924839.
+
+For HR use, ranking also matters. In the Top 20 percent list, Precision is 0.970000, Recall is 0.815126, and Lift is 4.075630. This means HR can focus on a much richer high-risk group than random selection.
+
+So this section validates both the model design and the action list. Next, S6 explains whether HR can understand why an employee is flagged as high risk.

@@ -146,6 +146,16 @@ def _scale_1_to_4(value) -> float:
 
 
 def _map_attrition(value) -> str:
+    try:
+        numeric = float(value)
+        if np.isfinite(numeric):
+            if numeric == 1.0:
+                return "Yes"
+            if numeric == 0.0:
+                return "No"
+    except Exception:
+        pass
+
     token = _normalize_token(value)
     if token in {"1", "yes", "y", "true", "left", "离职", "已离职"}:
         return "Yes"
@@ -317,11 +327,11 @@ def prepare_employee_source_dataframe(df: pd.DataFrame) -> tuple[pd.DataFrame, d
     _fill_if_missing(working, "YearsInCurrentRole", np.minimum(_numeric_series(working, "YearsAtCompany").fillna(3), 3))
     _fill_if_missing(working, "YearsWithCurrManager", np.minimum(_numeric_series(working, "YearsAtCompany").fillna(3), 4))
 
-    if "JobRole" not in working.columns:
-        working["JobRole"] = [
-            _derive_job_role(row.get("Department", ""), row.get("JobLevel", np.nan), row.get("MonthlyIncome", np.nan))
-            for _, row in working.iterrows()
-        ]
+    derived_job_roles = [
+        _derive_job_role(row.get("Department", ""), row.get("JobLevel", np.nan), row.get("MonthlyIncome", np.nan))
+        for _, row in working.iterrows()
+    ]
+    _fill_if_missing(working, "JobRole", derived_job_roles)
 
     keep_mask = _valid_employee_rows(working)
     working = working.loc[keep_mask].reset_index(drop=True)

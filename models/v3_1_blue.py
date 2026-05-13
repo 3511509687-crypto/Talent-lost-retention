@@ -4,6 +4,7 @@ import glob
 import shutil
 import logging
 import re
+import gc
 import warnings
 warnings.filterwarnings("ignore")
 
@@ -80,7 +81,17 @@ from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
 from sklearn.impute import SimpleImputer
 from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.metrics import roc_auc_score, accuracy_score, f1_score, precision_score, recall_score
+from sklearn.metrics import (
+    roc_auc_score,
+    accuracy_score,
+    f1_score,
+    precision_score,
+    recall_score,
+    roc_curve,
+    precision_recall_curve,
+    average_precision_score,
+    confusion_matrix,
+)
 from sklearn.linear_model import LogisticRegression
 from sklearn.ensemble import ExtraTreesClassifier
 import torch
@@ -125,6 +136,10 @@ LEGACY_EMPLOYEE_DATA_PATH = os.path.join(CURRENT_DIR, "WA_Fn-UseC_-HR-Employee-A
 LEGACY_POLICY_DATA_PATH = os.path.join(CURRENT_DIR, "人才政策信息表(1).xlsx")
 DEFAULT_PROCESSED_EMPLOYEE_DIR = os.path.join(PROJECT_ROOT, "uploads", "processed", "employee")
 DEFAULT_PROCESSED_POLICY_DIR = os.path.join(PROJECT_ROOT, "uploads", "processed", "policy")
+PREFERRED_EMPLOYEE_INPUT_PATTERNS = (
+    "*clean_hr_comma_sep_14999_standardized.csv",
+    "*hr_comma_sep_14999_standardized.csv",
+)
 
 
 def latest_input_file(base_dir, patterns):
@@ -141,12 +156,17 @@ def latest_input_file(base_dir, patterns):
     return os.path.abspath(max(candidates, key=lambda path: (os.path.getmtime(path), path)))
 
 
-def resolve_default_input_path(processed_dir, patterns, fallback_path, env_var_name=None):
-    """解析本地直接运行的默认输入：环境变量 > 最新标准化数据 > 旧内置样本。"""
+def resolve_default_input_path(processed_dir, patterns, fallback_path, env_var_name=None, preferred_patterns=None):
+    """解析本地直接运行的默认输入：环境变量 > 优先数据 > 最新标准化数据 > 旧内置样本。"""
     if env_var_name:
         override_path = os.environ.get(env_var_name, "").strip()
         if override_path:
             return os.path.abspath(os.path.expanduser(override_path))
+    if preferred_patterns:
+        for preferred_pattern in preferred_patterns:
+            preferred_path = latest_input_file(processed_dir, (preferred_pattern,))
+            if preferred_path:
+                return preferred_path
     latest_path = latest_input_file(processed_dir, patterns)
     if latest_path:
         return latest_path
@@ -159,6 +179,7 @@ DATA_PATH = resolve_default_input_path(
     ("*_standardized.csv", "*.csv"),
     LEGACY_EMPLOYEE_DATA_PATH,
     env_var_name="HR_EMPLOYEE_DATA_PATH",
+    preferred_patterns=PREFERRED_EMPLOYEE_INPUT_PATTERNS,
 )
 POLICY_PATH = resolve_default_input_path(
     DEFAULT_PROCESSED_POLICY_DIR,
@@ -186,7 +207,10 @@ LGB_REGULARIZED_PARAM_DIST = {
 }
 LGB_EARLY_STOPPING_VALID_SIZE = 0.18
 LGB_EARLY_STOPPING_ROUNDS = 30
-SHAP_TOP3_MAX_ROWS = int(os.environ.get("HR_SHAP_TOP3_MAX_ROWS", "5000"))
+SHAP_TOP3_MAX_ROWS = int(os.environ.get("HR_SHAP_TOP3_MAX_ROWS", "800"))
+REPORT_PLOT_DPI = int(os.environ.get("HR_REPORT_PLOT_DPI", "110"))
+DECISION_PLOT_MAX_POINTS = int(os.environ.get("HR_DECISION_PLOT_MAX_POINTS", "3000"))
+ACTUAL_PREDICTED_BIN_COUNT = int(os.environ.get("HR_ACTUAL_PREDICTED_BINS", "20"))
 RISK_SEGMENT_TARGET_SHARE = float(os.environ.get("HR_RISK_SEGMENT_TARGET_SHARE", "0.30"))
 PRED_POSITIVE_RATE_MIN = float(os.environ.get("HR_PRED_POSITIVE_RATE_MIN", "0.15"))
 PRED_POSITIVE_RATE_MAX = float(os.environ.get("HR_PRED_POSITIVE_RATE_MAX", "0.25"))
@@ -440,6 +464,79 @@ def safe_read_csv(path):
     if file_ext in {".xlsx", ".xls"}:
         return pd.read_excel(path)
     return pd.read_csv(path)
+
+
+def build_employee_input_quality_summary(df):
+    """汇总员工输入文件的关键数据质量信息，便于确认是否读到干净数据。"""
+    row_count = int(len(df))
+    col_count = int(len(df.columns))
+    attrition_yes = 0
+    attrition_no = 0
+    attrition_unmapped = 0
+    positive_rate = np.nan
+
+    if "Attrition" in df.columns:
+        attrition_tokens = df["Attrition"].astype(str).str.strip().str.lower()
+        yes_mask = attrition_tokens.eq("yes")
+        no_mask = attrition_tokens.eq("no")
+        attrition_yes = int(yes_mask.sum())
+        attrition_no = int(no_mask.sum())
+        attrition_unmapped = int((~yes_mask & ~no_mask).sum())
+        positive_rate = float(attrition_yes / row_count) if row_count else np.nan
+
+    jobrole_missing_rate = np.nan
+    if "JobRole" in df.columns and row_count:
+        jobrole_missing = df["JobRole"].isna() | df["JobRole"].astype(str).str.strip().isin(["", "nan", "None"])
+        jobrole_missing_rate = float(jobrole_missing.mean())
+
+    return {
+        "row_count": row_count,
+        "column_count": col_count,
+        "attrition_yes": attrition_yes,
+        "attrition_no": attrition_no,
+        "attrition_unmapped": attrition_unmapped,
+        "positive_rate": positive_rate,
+        "jobrole_missing_rate": jobrole_missing_rate,
+    }
+
+
+def validate_employee_input_quality(df, source_path="", min_external_rows=20000):
+    """拒绝已知异常的合并员工数据，避免旧坏文件进入训练。"""
+    summary = build_employee_input_quality_summary(df)
+    source_name = os.path.basename(os.fspath(source_path or ""))
+    is_external_combined = "external_sources" in source_name
+    positive_rate = summary["positive_rate"]
+    jobrole_missing_rate = summary["jobrole_missing_rate"]
+
+    if summary["attrition_unmapped"] > 0:
+        raise ValueError(
+            "员工数据存在无法识别的Attrition标签："
+            f"{summary['attrition_unmapped']} 行，请先重新标准化数据。"
+        )
+
+    if (
+        is_external_combined
+        and summary["row_count"] >= int(min_external_rows)
+        and pd.notna(positive_rate)
+        and positive_rate < 0.10
+    ):
+        raise ValueError(
+            "疑似旧坏合并数据：external_sources文件的Attrition=Yes占比过低 "
+            f"({positive_rate:.4f})。请使用clean_external_sources标准化文件。"
+        )
+
+    if (
+        is_external_combined
+        and summary["row_count"] >= int(min_external_rows)
+        and pd.notna(jobrole_missing_rate)
+        and jobrole_missing_rate > 0.50
+    ):
+        raise ValueError(
+            "疑似旧坏合并数据：external_sources文件的JobRole缺失率过高 "
+            f"({jobrole_missing_rate:.4f})。请使用clean_external_sources标准化文件。"
+        )
+
+    return summary
 
 
 def safe_read_excel(path):
@@ -1190,6 +1287,41 @@ def calculate_similarity(vec1, vec2):
     return sim
 
 
+def get_transformed_feature_names(preprocessor, fallback_count=None):
+    """从ColumnTransformer中抽取模型实际看到的特征名。"""
+    feature_names = []
+    try:
+        for name, trans, cols in preprocessor.transformers_:
+            if name == "remainder" and trans == "drop":
+                continue
+            if name == "num":
+                feature_names.extend([str(col) for col in cols])
+            elif name == "cat":
+                ohe = trans.named_steps.get("ohe") if hasattr(trans, "named_steps") else None
+                if ohe is not None and hasattr(ohe, "get_feature_names_out"):
+                    feature_names.extend([str(item) for item in ohe.get_feature_names_out(cols)])
+                else:
+                    feature_names.extend([str(col) for col in cols])
+            else:
+                feature_names.extend([str(col) for col in cols])
+    except Exception:
+        feature_names = []
+
+    if fallback_count is not None and len(feature_names) != int(fallback_count):
+        feature_names = [f"feature_{idx}" for idx in range(int(fallback_count))]
+    return feature_names
+
+
+def get_named_base_estimator(model, estimator_name):
+    """兼容单seed/多seed融合模型，取出指定基础模型。"""
+    for seed_model in get_seed_model_list(model):
+        named_estimators = getattr(seed_model, "named_estimators_", {}) or {}
+        estimator = named_estimators.get(estimator_name)
+        if estimator is not None:
+            return estimator
+    return None
+
+
 # -----------------------
 # 新增：可视化工具函数（4类核心图表）
 # -----------------------
@@ -1260,7 +1392,7 @@ def plot_model_metrics(metrics, save_name="model_metrics.png", alias_names=None)
             logging.warning("⚠️ model metrics图例生成失败，但不影响图表输出")
 
         plt.tight_layout()
-        plt.savefig(save_path, dpi=150, bbox_inches="tight")
+        plt.savefig(save_path, dpi=REPORT_PLOT_DPI, bbox_inches="tight")
         plt.close()
         logging.info("✅ 模型性能图已保存：%s", save_path)
 
@@ -1306,7 +1438,7 @@ def plot_feature_importance(model, preprocessor, top_n=15, save_name="feature_im
         plt.xlabel('Importance Score', fontsize=12)
         plt.ylabel('Feature Name', fontsize=12)
         plt.tight_layout()
-        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        plt.savefig(save_path, dpi=REPORT_PLOT_DPI, bbox_inches='tight')
         plt.close()
         logging.info(f"✅ 特征重要性图已保存：{save_path}")
     except Exception as e:
@@ -1335,9 +1467,470 @@ def plot_attrition_risk_distribution(y_pred_prob, threshold=0.5, save_name="attr
     plt.ylabel('Number of Employees', fontsize=12)
     plt.legend(fontsize=11)
     plt.tight_layout()
-    plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    plt.savefig(save_path, dpi=REPORT_PLOT_DPI, bbox_inches='tight')
     plt.close()
     logging.info(f"✅ 风险分布直方图已保存：{save_path}")
+
+
+def plot_probability_r2_fit(
+    y_true,
+    y_prob,
+    metrics=None,
+    metric_prefix="test",
+    save_name="probability_r2_fit.png",
+    alias_names=None,
+    title=None,
+):
+    """绘制真实标签-预测概率拟合散点图，并标注概率R方。"""
+    save_path = os.path.join(CURRENT_DIR, save_name)
+    alias_names = alias_names or []
+    try:
+        y_true_arr = np.asarray(y_true, dtype=float)
+        y_prob_arr = np.asarray(y_prob, dtype=float)
+        finite_mask = np.isfinite(y_true_arr) & np.isfinite(y_prob_arr)
+        y_true_arr = y_true_arr[finite_mask]
+        y_prob_arr = y_prob_arr[finite_mask]
+
+        if len(y_true_arr) < 2 or len(np.unique(y_true_arr)) < 2:
+            logging.warning("❌ 概率R方拟合图未生成：真实标签样本不足或仅含单一类别")
+            return None
+
+        probability_metrics = evaluate_probability_regression_metrics(y_true_arr, y_prob_arr)
+        r2_value = safe_float((metrics or {}).get(f"{metric_prefix}_probability_r2"))
+        rmse_value = safe_float((metrics or {}).get(f"{metric_prefix}_probability_rmse"))
+        brier_value = safe_float((metrics or {}).get(f"{metric_prefix}_probability_brier_score"))
+        if r2_value is None:
+            r2_value = probability_metrics["r2"]
+        if rmse_value is None:
+            rmse_value = probability_metrics["rmse"]
+        if brier_value is None:
+            brier_value = probability_metrics["brier_score"]
+
+        slope, intercept = np.polyfit(y_true_arr, y_prob_arr, 1)
+        x_line = np.linspace(0.0, 1.0, 100)
+        y_line = np.clip(slope * x_line + intercept, 0.0, 1.0)
+
+        jitter_rng = np.random.default_rng(RANDOM_STATE)
+        x_scatter = np.clip(y_true_arr + jitter_rng.normal(0.0, 0.025, size=len(y_true_arr)), -0.08, 1.08)
+
+        plt.figure(figsize=(9.5, 6.2))
+        ax = plt.gca()
+        ax.scatter(
+            x_scatter,
+            y_prob_arr,
+            s=18,
+            alpha=0.36,
+            color="#2f7ed8",
+            edgecolors="none",
+            label="样本预测概率",
+        )
+        ax.plot(x_line, y_line, color="#d84b48", linewidth=2.4, label="线性拟合线")
+        ax.plot([0, 1], [0, 1], color="#555555", linestyle="--", linewidth=1.4, alpha=0.65, label="理想参考线")
+
+        ax.set_title(title or "Probability Prediction R-squared Fit", fontsize=14, fontweight="bold", pad=16)
+        ax.set_xlabel("Actual Attrition Label (0=No, 1=Yes)", fontsize=11)
+        ax.set_ylabel("Predicted Attrition Probability", fontsize=11)
+        ax.set_xlim(-0.12, 1.12)
+        ax.set_ylim(-0.02, 1.02)
+        ax.set_xticks([0, 1])
+        ax.set_xticklabels(["0 不流失", "1 流失"])
+
+        annotation = (
+            f"R² = {r2_value:.4f}\n"
+            f"RMSE = {rmse_value:.4f}\n"
+            f"Brier = {brier_value:.4f}\n"
+            f"Fit: y = {slope:.3f}x + {intercept:.3f}"
+        )
+        ax.text(
+            0.04,
+            0.96,
+            annotation,
+            transform=ax.transAxes,
+            va="top",
+            ha="left",
+            fontsize=10.5,
+            bbox={"boxstyle": "round,pad=0.35", "facecolor": "white", "edgecolor": "#cccccc", "alpha": 0.9},
+        )
+        ax.legend(loc="lower right", fontsize=10)
+        plt.tight_layout()
+        plt.savefig(save_path, dpi=REPORT_PLOT_DPI, bbox_inches="tight")
+        plt.close()
+        logging.info("✅ 概率R方拟合图已保存：%s", save_path)
+
+        for alias_name in alias_names:
+            alias_path = os.path.join(CURRENT_DIR, alias_name)
+            if os.path.abspath(alias_path) == os.path.abspath(save_path):
+                continue
+            try:
+                shutil.copyfile(save_path, alias_path)
+                logging.info("✅ 概率R方拟合图别名已保存：%s", alias_path)
+            except Exception as exc:
+                logging.warning("⚠️ 概率R方拟合图别名保存失败：%s | %s", alias_path, exc)
+
+        return save_path
+    except Exception as exc:
+        plt.close("all")
+        logging.warning("❌ 概率R方拟合图生成失败：%s", exc)
+        return None
+
+
+def plot_lr_sigmoid_curve(save_name="lr_sigmoid_decision_curve.png"):
+    """绘制LR sigmoid概率映射曲线，用作论文基准模型说明图。"""
+    save_path = os.path.join(CURRENT_DIR, save_name)
+    try:
+        z_values = np.linspace(-8, 8, 300)
+        probabilities = 1.0 / (1.0 + np.exp(-z_values))
+        plt.figure(figsize=(8.5, 5.4))
+        ax = plt.gca()
+        ax.plot(z_values, probabilities, color="#2f7ed8", linewidth=2.4)
+        ax.axhline(0.5, color="#d84b48", linestyle="--", linewidth=1.5, label="τ = 0.5")
+        ax.axvline(0.0, color="#555555", linestyle="--", linewidth=1.2)
+        ax.set_title("Logistic Regression Sigmoid Decision Curve", fontsize=13, fontweight="bold", pad=14)
+        ax.set_xlabel("Linear score z = w^T x + b")
+        ax.set_ylabel("P(y=1|x)")
+        ax.set_ylim(-0.02, 1.02)
+        ax.legend(loc="lower right")
+        plt.tight_layout()
+        plt.savefig(save_path, dpi=REPORT_PLOT_DPI, bbox_inches="tight")
+        plt.close()
+        logging.info("✅ LR Sigmoid决策曲线已保存：%s", save_path)
+        return save_path
+    except Exception as exc:
+        plt.close("all")
+        logging.warning("❌ LR Sigmoid决策曲线生成失败：%s", exc)
+        return None
+
+
+def plot_binned_actual_vs_predicted(y_true, y_prob, n_bins=None, save_name="binned_actual_vs_predicted.png"):
+    """绘制分类概率模型更惯用的分箱Actual vs Predicted图。"""
+    save_path = os.path.join(CURRENT_DIR, save_name)
+    try:
+        bin_frame = build_actual_vs_predicted_bin_frame(y_true, y_prob, n_bins=n_bins)
+        if bin_frame.empty or len(bin_frame) < 2:
+            logging.warning("❌ 分箱Actual vs Predicted图未生成：有效分箱不足")
+            return None
+
+        x = bin_frame["risk_bin"].to_numpy(dtype=int)
+        predicted = bin_frame["mean_predicted_probability"].to_numpy(dtype=float)
+        actual = bin_frame["actual_attrition_rate"].to_numpy(dtype=float)
+        counts = bin_frame["sample_count"].to_numpy(dtype=int)
+        weighted_gap = float(np.average(np.abs(actual - predicted), weights=counts))
+        bin_count = len(bin_frame)
+        dense_bins = bin_count > 30
+        line_width = 1.55 if dense_bins else 2.2
+        marker_size = 3.0 if dense_bins else 5.0
+
+        plt.figure(figsize=(12.2, 5.8) if dense_bins else (10, 5.8))
+        ax1 = plt.gca()
+        ax1.plot(
+            x,
+            predicted,
+            marker="o",
+            markersize=marker_size,
+            linewidth=line_width,
+            color="#2f7ed8",
+            label="Mean predicted probability",
+        )
+        ax1.plot(
+            x,
+            actual,
+            marker="s",
+            markersize=marker_size,
+            linewidth=line_width,
+            color="#d84b48",
+            label="Actual attrition rate",
+        )
+        ax1.set_ylim(0, 1.05)
+        if dense_bins:
+            tick_positions = np.unique(np.concatenate(([x[0]], np.arange(10, bin_count + 1, 10), [x[-1]])))
+            ax1.set_xticks(tick_positions)
+            ax1.set_xticklabels([f"{int(pos)}%" for pos in tick_positions])
+            ax1.set_xlabel("Risk percentile bin by predicted probability (1% groups, low to high)")
+        else:
+            ax1.set_xticks(x)
+            ax1.set_xticklabels(bin_frame["risk_bin_label"].astype(str).tolist())
+            ax1.set_xlabel("Risk bin by predicted probability (low to high)")
+        ax1.set_ylabel("Probability / Actual rate")
+        ax1.set_title("Actual vs Predicted Probability by Risk Percentile Bin", fontsize=13, fontweight="bold", pad=14)
+        ax1.grid(alpha=0.25)
+        ax1.legend(loc="upper left")
+
+        ax2 = ax1.twinx()
+        ax2.bar(x, counts, width=0.78 if dense_bins else 0.58, color="#b8c4d6", alpha=0.24, label="Sample count")
+        ax2.set_ylabel("Sample count")
+        ax2.set_ylim(0, max(counts) * 3.0)
+
+        ax1.text(
+            0.02,
+            0.08,
+            f"Weighted mean |Actual - Predicted| = {weighted_gap:.4f}",
+            transform=ax1.transAxes,
+            fontsize=9,
+            va="bottom",
+            ha="left",
+            bbox=dict(facecolor="#ffffff", edgecolor="#d0d7de", boxstyle="round,pad=0.35", alpha=0.92),
+        )
+
+        plt.tight_layout()
+        plt.savefig(save_path, dpi=REPORT_PLOT_DPI, bbox_inches="tight")
+        plt.close()
+        logging.info("✅ 分箱Actual vs Predicted图已保存：%s", save_path)
+        return save_path
+    except Exception as exc:
+        plt.close("all")
+        logging.warning("❌ 分箱Actual vs Predicted图生成失败：%s", exc)
+        return None
+
+
+def plot_classification_diagnostics(y_true, y_prob, threshold, save_name="classification_diagnostics.png"):
+    """输出ROC、PR和混淆矩阵组合图。"""
+    save_path = os.path.join(CURRENT_DIR, save_name)
+    try:
+        y_true_arr = np.asarray(y_true, dtype=int)
+        y_prob_arr = np.asarray(y_prob, dtype=float)
+        threshold_array = np.asarray(threshold, dtype=float)
+        if threshold_array.ndim == 0:
+            threshold_array = np.full(len(y_prob_arr), float(threshold_array), dtype=float)
+        y_pred_arr = (y_prob_arr >= threshold_array).astype(int)
+
+        if len(np.unique(y_true_arr)) < 2:
+            logging.warning("❌ ROC/PR/混淆矩阵未生成：真实标签仅含单一类别")
+            return None
+
+        fpr, tpr, _ = roc_curve(y_true_arr, y_prob_arr)
+        precision_curve, recall_curve, _ = precision_recall_curve(y_true_arr, y_prob_arr)
+        auc_value = safe_binary_auc(y_true_arr, y_prob_arr)
+        ap_value = average_precision_score(y_true_arr, y_prob_arr)
+        matrix = confusion_matrix(y_true_arr, y_pred_arr, labels=[0, 1])
+
+        plt.figure(figsize=(15, 4.8))
+        gs = plt.GridSpec(1, 3, width_ratios=[1, 1, 1])
+
+        ax1 = plt.subplot(gs[0, 0])
+        ax1.plot(fpr, tpr, color="#2f7ed8", linewidth=2.2, label=f"AUC={auc_value:.4f}")
+        ax1.plot([0, 1], [0, 1], color="#999999", linestyle="--", linewidth=1.1)
+        ax1.set_title("ROC Curve", fontsize=12, fontweight="bold")
+        ax1.set_xlabel("False Positive Rate")
+        ax1.set_ylabel("True Positive Rate")
+        ax1.legend(loc="lower right")
+
+        ax2 = plt.subplot(gs[0, 1])
+        ax2.plot(recall_curve, precision_curve, color="#d97904", linewidth=2.2, label=f"AP={ap_value:.4f}")
+        ax2.set_title("Precision-Recall Curve", fontsize=12, fontweight="bold")
+        ax2.set_xlabel("Recall")
+        ax2.set_ylabel("Precision")
+        ax2.set_ylim(0, 1.05)
+        ax2.legend(loc="lower left")
+
+        ax3 = plt.subplot(gs[0, 2])
+        sns.heatmap(
+            matrix,
+            annot=True,
+            fmt="d",
+            cmap="Blues",
+            cbar=False,
+            xticklabels=["Pred 0", "Pred 1"],
+            yticklabels=["Actual 0", "Actual 1"],
+            ax=ax3,
+        )
+        ax3.set_title("Confusion Matrix", fontsize=12, fontweight="bold")
+        ax3.set_xlabel("Predicted")
+        ax3.set_ylabel("Actual")
+
+        plt.tight_layout()
+        plt.savefig(save_path, dpi=REPORT_PLOT_DPI, bbox_inches="tight")
+        plt.close()
+        logging.info("✅ ROC/PR/混淆矩阵诊断图已保存：%s", save_path)
+        return save_path
+    except Exception as exc:
+        plt.close("all")
+        logging.warning("❌ ROC/PR/混淆矩阵诊断图生成失败：%s", exc)
+        return None
+
+
+def plot_lr_coefficients(model, preprocessor, save_name="lr_feature_coefficients.png", top_n=20):
+    """绘制LR特征系数条形图。"""
+    save_path = os.path.join(CURRENT_DIR, save_name)
+    try:
+        lr_model = get_named_base_estimator(model, "lr")
+        if lr_model is None or not hasattr(lr_model, "coef_"):
+            raise RuntimeError("未找到可解释的LR基础模型")
+        coef = np.asarray(lr_model.coef_).reshape(-1)
+        feature_names = get_transformed_feature_names(preprocessor, fallback_count=len(coef))
+        frame = pd.DataFrame({
+            "feature": feature_names,
+            "coefficient": coef,
+            "abs_coefficient": np.abs(coef),
+        }).sort_values("abs_coefficient", ascending=False).head(top_n)
+        frame = frame.sort_values("coefficient", ascending=True)
+
+        colors = np.where(frame["coefficient"] >= 0, "#d84b48", "#2f7ed8")
+        plt.figure(figsize=(11, 7))
+        ax = plt.gca()
+        ax.barh(frame["feature"], frame["coefficient"], color=colors, edgecolor="black", linewidth=0.25)
+        ax.axvline(0, color="#555555", linewidth=1.1)
+        ax.set_title(f"Logistic Regression Top-{top_n} Coefficients", fontsize=13, fontweight="bold", pad=14)
+        ax.set_xlabel("Coefficient")
+        ax.set_ylabel("Feature")
+        plt.tight_layout()
+        plt.savefig(save_path, dpi=REPORT_PLOT_DPI, bbox_inches="tight")
+        plt.close()
+        logging.info("✅ LR特征系数图已保存：%s", save_path)
+        return save_path
+    except Exception as exc:
+        plt.close("all")
+        logging.warning("❌ LR特征系数图生成失败：%s", exc)
+        return None
+
+
+def get_lgb_gain_importances(model):
+    """返回LightGBM gain重要性；不可用时退回split重要性。"""
+    lgb_model = get_reference_lgb_model(model)
+    if lgb_model is None:
+        return None
+    booster = getattr(lgb_model, "booster_", None)
+    if booster is not None:
+        try:
+            gain = booster.feature_importance(importance_type="gain")
+            return np.asarray(gain, dtype=float)
+        except Exception:
+            pass
+    if hasattr(lgb_model, "feature_importances_"):
+        return np.asarray(lgb_model.feature_importances_, dtype=float)
+    return None
+
+
+def plot_lgb_gain_importance(model, preprocessor, save_name="lgb_gain_feature_importance.png", top_n=20):
+    """绘制LightGBM按gain计算的特征重要性。"""
+    save_path = os.path.join(CURRENT_DIR, save_name)
+    try:
+        importances = get_lgb_gain_importances(model)
+        if importances is None:
+            raise RuntimeError("未找到LightGBM gain重要性")
+        feature_names = get_transformed_feature_names(preprocessor, fallback_count=len(importances))
+        frame = pd.DataFrame({
+            "feature": feature_names,
+            "gain_importance": importances,
+        }).sort_values("gain_importance", ascending=False).head(top_n)
+        frame = frame.sort_values("gain_importance", ascending=True)
+
+        plt.figure(figsize=(11, 7))
+        ax = plt.gca()
+        ax.barh(frame["feature"], frame["gain_importance"], color="#4c9f70", edgecolor="black", linewidth=0.25)
+        ax.set_title(f"LightGBM Feature Importance by Gain Top-{top_n}", fontsize=13, fontweight="bold", pad=14)
+        ax.set_xlabel("Gain importance")
+        ax.set_ylabel("Feature")
+        plt.tight_layout()
+        plt.savefig(save_path, dpi=REPORT_PLOT_DPI, bbox_inches="tight")
+        plt.close()
+        logging.info("✅ LightGBM Gain特征重要性图已保存：%s", save_path)
+        return save_path
+    except Exception as exc:
+        plt.close("all")
+        logging.warning("❌ LightGBM Gain特征重要性图生成失败：%s", exc)
+        return None
+
+
+def plot_et_lgb_feature_importance_comparison(model, preprocessor, save_name="et_lgb_feature_importance_comparison.png", top_n=20):
+    """绘制ET与LGB重要性的归一化对比图。"""
+    save_path = os.path.join(CURRENT_DIR, save_name)
+    try:
+        et_model = get_named_base_estimator(model, "et")
+        lgb_importance = get_lgb_gain_importances(model)
+        if et_model is None or not hasattr(et_model, "feature_importances_") or lgb_importance is None:
+            raise RuntimeError("缺少ET或LGB重要性")
+        et_importance = np.asarray(et_model.feature_importances_, dtype=float)
+        feature_count = min(len(et_importance), len(lgb_importance))
+        feature_names = get_transformed_feature_names(preprocessor, fallback_count=feature_count)
+
+        frame = pd.DataFrame({
+            "feature": feature_names[:feature_count],
+            "ET": et_importance[:feature_count],
+            "LGB": lgb_importance[:feature_count],
+        })
+        for column in ["ET", "LGB"]:
+            total = float(frame[column].sum())
+            frame[column] = frame[column] / total if total > 0 else frame[column]
+        frame["combined"] = frame["ET"] + frame["LGB"]
+        frame = frame.sort_values("combined", ascending=False).head(top_n).sort_values("combined", ascending=True)
+
+        y = np.arange(len(frame))
+        height = 0.38
+        plt.figure(figsize=(11, 7))
+        ax = plt.gca()
+        ax.barh(y - height / 2, frame["ET"], height=height, label="ET", color="#7b61a9")
+        ax.barh(y + height / 2, frame["LGB"], height=height, label="LGB", color="#4c9f70")
+        ax.set_yticks(y)
+        ax.set_yticklabels(frame["feature"])
+        ax.set_xlabel("Normalized importance")
+        ax.set_title(f"ET vs LGB Feature Importance Top-{top_n}", fontsize=13, fontweight="bold", pad=14)
+        ax.legend(loc="lower right")
+        plt.tight_layout()
+        plt.savefig(save_path, dpi=REPORT_PLOT_DPI, bbox_inches="tight")
+        plt.close()
+        logging.info("✅ ET与LGB特征重要性对比图已保存：%s", save_path)
+        return save_path
+    except Exception as exc:
+        plt.close("all")
+        logging.warning("❌ ET与LGB特征重要性对比图生成失败：%s", exc)
+        return None
+
+
+def plot_lgb_training_curves(cv_artifacts, save_name="lgb_training_curves.png"):
+    """绘制LightGBM早停阶段的AUC/Logloss曲线。"""
+    save_path = os.path.join(CURRENT_DIR, save_name)
+    try:
+        info = (cv_artifacts or {}).get("lgb_early_stop_info") or {}
+        evals_result = info.get("evals_result") or {}
+        valid_payload = next(iter(evals_result.values())) if evals_result else {}
+        auc_values = valid_payload.get("auc") or valid_payload.get("auc-mean") or []
+        logloss_values = valid_payload.get("binary_logloss") or valid_payload.get("binary_logloss-mean") or []
+        if not auc_values and not logloss_values:
+            logging.warning("❌ LGB训练曲线未生成：没有可用的evals_result_")
+            return None
+
+        plt.figure(figsize=(10, 5.6))
+        ax1 = plt.gca()
+        rounds = np.arange(1, max(len(auc_values), len(logloss_values)) + 1)
+        if auc_values:
+            ax1.plot(np.arange(1, len(auc_values) + 1), auc_values, color="#2f7ed8", linewidth=2, label="AUC")
+            ax1.set_ylabel("AUC", color="#2f7ed8")
+            ax1.tick_params(axis="y", labelcolor="#2f7ed8")
+        if logloss_values:
+            ax2 = ax1.twinx()
+            ax2.plot(np.arange(1, len(logloss_values) + 1), logloss_values, color="#d97904", linewidth=2, label="Logloss")
+            ax2.set_ylabel("Logloss", color="#d97904")
+            ax2.tick_params(axis="y", labelcolor="#d97904")
+        best_iteration = safe_float(info.get("best_iteration"))
+        if best_iteration is not None:
+            ax1.axvline(best_iteration, color="#555555", linestyle="--", linewidth=1.2, label=f"Best iter={int(best_iteration)}")
+        ax1.set_xlabel("Boosting round")
+        ax1.set_title("LightGBM Early-Stopping Validation Curve", fontsize=13, fontweight="bold", pad=14)
+        ax1.set_xlim(1, max(rounds))
+        ax1.legend(loc="lower right")
+        plt.tight_layout()
+        plt.savefig(save_path, dpi=REPORT_PLOT_DPI, bbox_inches="tight")
+        plt.close()
+        logging.info("✅ LightGBM训练轮数曲线已保存：%s", save_path)
+        return save_path
+    except Exception as exc:
+        plt.close("all")
+        logging.warning("❌ LightGBM训练轮数曲线生成失败：%s", exc)
+        return None
+
+
+def release_report_memory(stage=""):
+    """释放报告阶段的图形和临时对象，避免训练后内存碎片导致导出失败。"""
+    try:
+        plt.close("all")
+    except Exception:
+        pass
+    try:
+        gc.collect()
+    except Exception:
+        pass
+    if stage:
+        logging.debug("报告阶段内存清理完成：%s", stage)
 
 
 def plot_attrition_decision_view(df_pred, threshold=0.5, save_name="attrition_decision_view.png", alias_names=None):
@@ -1350,7 +1943,7 @@ def plot_attrition_decision_view(df_pred, threshold=0.5, save_name="attrition_de
         return
 
     try:
-        view_df = df_pred.copy()
+        view_df = df_pred[["流失概率", "预测流失标签"]].copy(deep=False)
         view_df["流失概率"] = pd.to_numeric(view_df["流失概率"], errors="coerce")
         view_df["预测流失标签"] = pd.to_numeric(view_df["预测流失标签"], errors="coerce").fillna(0).astype(int)
         view_df = view_df.dropna(subset=["流失概率"]).sort_values("流失概率", ascending=False).reset_index(drop=True)
@@ -1359,9 +1952,15 @@ def plot_attrition_decision_view(df_pred, threshold=0.5, save_name="attrition_de
             return
 
         total = len(view_df)
-        x = np.arange(1, total + 1)
-        y = view_df["流失概率"].values
-        colors = np.where(view_df["预测流失标签"].values == 1, "#d84b48", "#2f7ed8")
+        if total > DECISION_PLOT_MAX_POINTS:
+            sampled_positions = np.unique(np.linspace(0, total - 1, DECISION_PLOT_MAX_POINTS).astype(int))
+            plot_df = view_df.iloc[sampled_positions].copy(deep=False)
+            logging.info("去留预测可视化使用抽样点：%s/%s", len(plot_df), total)
+        else:
+            plot_df = view_df
+        x = plot_df.index.to_numpy(dtype=int) + 1
+        y = plot_df["流失概率"].to_numpy(dtype=float)
+        colors = np.where(plot_df["预测流失标签"].to_numpy(dtype=int) == 1, "#d84b48", "#2f7ed8")
 
         plt.figure(figsize=(13, 6.8))
         gs = plt.GridSpec(1, 2, width_ratios=[2.4, 1.1])
@@ -1433,7 +2032,7 @@ def plot_attrition_decision_view(df_pred, threshold=0.5, save_name="attrition_de
         )
 
         plt.tight_layout()
-        plt.savefig(save_path, dpi=150, bbox_inches="tight")
+        plt.savefig(save_path, dpi=REPORT_PLOT_DPI, bbox_inches="tight")
         plt.close()
         logging.info("✅ 员工去留预测可视化图已保存：%s", save_path)
 
@@ -1469,7 +2068,7 @@ def plot_policy_job_matching(policy_post_mapping, save_name="policy_job_matching
     plt.xlabel('Policy Matching Score', fontsize=12)
     plt.ylabel('Job Role', fontsize=12)
     plt.tight_layout()
-    plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    plt.savefig(save_path, dpi=REPORT_PLOT_DPI, bbox_inches='tight')
     plt.close()
     logging.info(f"✅ 政策-岗位匹配图已保存：{save_path}")
 
@@ -1480,15 +2079,31 @@ def plot_policy_job_matching(policy_post_mapping, save_name="policy_job_matching
 def load_and_preprocess_employee(path):
     """加载员工数据并预处理（缺失值填充、特征衍生）"""
     df = safe_read_csv(path)
+    input_quality = validate_employee_input_quality(df, source_path=path)
+    logging.info(
+        "员工输入质量：原始形状=(%s, %s) | Attrition Yes=%s No=%s 流失率=%.4f | JobRole缺失率=%.4f",
+        input_quality["row_count"],
+        input_quality["column_count"],
+        input_quality["attrition_yes"],
+        input_quality["attrition_no"],
+        input_quality["positive_rate"],
+        input_quality["jobrole_missing_rate"],
+    )
 
     # 删除无用列
+    dropped_cols = []
     for c in DROP_COLS:
         if c in df.columns:
             df.drop(columns=c, inplace=True)
+            dropped_cols.append(c)
+    if dropped_cols:
+        logging.info("模型训练前移除无建模价值列：%s", ", ".join(dropped_cols))
 
     # 标签编码（Attrition→0/1）
     if "Attrition" in df.columns:
         df["AttritionFlag"] = df["Attrition"].map({"Yes": 1, "No": 0})
+        if df["AttritionFlag"].isna().any():
+            raise ValueError("员工数据存在无法映射为0/1的Attrition标签，请先重新标准化数据。")
 
     # 缺失值填充（数值型→中位数，类别型→Missing）
     num_cols = df.select_dtypes(include=[np.number]).columns.tolist()
@@ -2046,6 +2661,45 @@ def evaluate_binary_probabilities(y_true, y_prob, threshold):
     }
 
 
+def evaluate_probability_regression_metrics(y_true, y_prob):
+    """将0/1真实标签与预测概率作为概率回归任务，计算R方、RMSE等本地评估指标。"""
+    y_true_arr = np.asarray(y_true, dtype=float)
+    y_prob_arr = np.asarray(y_prob, dtype=float)
+    finite_mask = np.isfinite(y_true_arr) & np.isfinite(y_prob_arr)
+    if not np.any(finite_mask):
+        return {
+            "r2": np.nan,
+            "rmse": np.nan,
+            "mae": np.nan,
+            "brier_score": np.nan,
+        }
+
+    actual = y_true_arr[finite_mask]
+    prob = y_prob_arr[finite_mask]
+    residual = actual - prob
+    squared_error = residual ** 2
+    mse = float(np.mean(squared_error))
+    mae = float(np.mean(np.abs(residual)))
+    total_sum_squares = float(np.sum((actual - float(np.mean(actual))) ** 2))
+    residual_sum_squares = float(np.sum(squared_error))
+    r2 = float(1.0 - residual_sum_squares / total_sum_squares) if total_sum_squares > 0 else np.nan
+
+    return {
+        "r2": r2,
+        "rmse": float(np.sqrt(mse)),
+        "mae": mae,
+        "brier_score": mse,
+    }
+
+
+def prefix_probability_regression_metrics(split_key, metric_payload):
+    """给概率回归指标添加数据切分前缀，便于写入统一metrics字典。"""
+    return {
+        f"{split_key}_probability_{metric_key}": metric_value
+        for metric_key, metric_value in metric_payload.items()
+    }
+
+
 def safe_binary_auc(y_true, y_prob):
     """安全计算二分类AUC；若单折仅含单一类别则返回NaN。"""
     y_array = np.asarray(y_true)
@@ -2107,6 +2761,7 @@ def build_fold_metric_row(
 ):
     """构建单折指标记录，供导出和日志分析使用。"""
     payload = evaluate_binary_probabilities(y_true, y_prob, threshold)
+    probability_payload = evaluate_probability_regression_metrics(y_true, y_prob)
     return {
         "fold_id": int(fold_id),
         "stage": stage,
@@ -2121,6 +2776,10 @@ def build_fold_metric_row(
         "recall": float(payload["recall"]),
         "f1": float(payload["f1"]),
         "pred_positive_rate": float(payload["pred_positive_rate"]),
+        "probability_r2": float(probability_payload["r2"]) if pd.notna(probability_payload["r2"]) else np.nan,
+        "probability_rmse": float(probability_payload["rmse"]) if pd.notna(probability_payload["rmse"]) else np.nan,
+        "probability_mae": float(probability_payload["mae"]) if pd.notna(probability_payload["mae"]) else np.nan,
+        "probability_brier_score": float(probability_payload["brier_score"]) if pd.notna(probability_payload["brier_score"]) else np.nan,
         "threshold_strategy": threshold_strategy,
         "threshold_value": float(np.mean(np.asarray(threshold, dtype=float))),
         "high_risk_share": float(high_risk_share) if pd.notna(high_risk_share) else np.nan,
@@ -2135,7 +2794,8 @@ def build_cv_summary_frame(fold_metrics_df):
     summary_rows = []
     metric_cols = [
         "auc", "acc", "precision", "recall", "f1",
-        "pred_positive_rate", "valid_positive_rate", "high_risk_share"
+        "pred_positive_rate", "valid_positive_rate", "high_risk_share",
+        "probability_r2", "probability_rmse", "probability_mae", "probability_brier_score",
     ]
     grouped = fold_metrics_df.groupby(["stage", "model_name"], dropna=False)
     for (stage, model_name), group_df in grouped:
@@ -2298,6 +2958,55 @@ def build_topk_metrics_frame(y_true, y_prob, rates=None, config_source="HR_TOPK_
             "基准流失率": base_positive_rate,
             "概率截断点": cutoff,
             "配置来源": config_source,
+        })
+    return pd.DataFrame(rows)
+
+
+def build_actual_vs_predicted_bin_frame(y_true, y_prob, n_bins=None):
+    """按预测概率等频分箱，比较每组平均预测概率和真实流失率。"""
+    y_array = np.asarray(y_true, dtype=float)
+    prob_array = np.asarray(y_prob, dtype=float)
+    finite_mask = np.isfinite(y_array) & np.isfinite(prob_array)
+    y_array = y_array[finite_mask].astype(int)
+    prob_array = prob_array[finite_mask]
+    if len(prob_array) == 0:
+        return pd.DataFrame(columns=[
+            "risk_bin",
+            "risk_bin_label",
+            "sample_count",
+            "mean_predicted_probability",
+            "actual_attrition_rate",
+            "calibration_gap",
+            "min_predicted_probability",
+            "max_predicted_probability",
+            "positive_count",
+        ])
+
+    resolved_bins = ACTUAL_PREDICTED_BIN_COUNT if n_bins is None else int(n_bins)
+    resolved_bins = max(1, min(resolved_bins, len(prob_array)))
+    order = np.argsort(prob_array, kind="mergesort")
+    sorted_y = y_array[order]
+    sorted_prob = prob_array[order]
+    bin_indices = np.array_split(np.arange(len(sorted_prob)), resolved_bins)
+
+    rows = []
+    for bin_id, indices in enumerate(bin_indices, start=1):
+        if len(indices) == 0:
+            continue
+        bin_y = sorted_y[indices]
+        bin_prob = sorted_prob[indices]
+        mean_prob = float(np.mean(bin_prob))
+        actual_rate = float(np.mean(bin_y))
+        rows.append({
+            "risk_bin": int(bin_id),
+            "risk_bin_label": f"P{bin_id:02d}" if resolved_bins == 100 else f"D{bin_id}" if resolved_bins == 10 else f"B{bin_id}",
+            "sample_count": int(len(indices)),
+            "mean_predicted_probability": mean_prob,
+            "actual_attrition_rate": actual_rate,
+            "calibration_gap": float(actual_rate - mean_prob),
+            "min_predicted_probability": float(np.min(bin_prob)),
+            "max_predicted_probability": float(np.max(bin_prob)),
+            "positive_count": int(np.sum(bin_y == 1)),
         })
     return pd.DataFrame(rows)
 
@@ -2655,7 +3364,7 @@ def refine_lgb_params_with_early_stopping(
             X_fit,
             y_fit,
             eval_set=[(X_valid, y_valid)],
-            eval_metric="auc",
+            eval_metric=["auc", "binary_logloss"],
             callbacks=callbacks,
         )
         best_iteration = getattr(early_stop_model, "best_iteration_", None)
@@ -2673,6 +3382,7 @@ def refine_lgb_params_with_early_stopping(
             "valid_auc": valid_auc,
             "valid_size": float(valid_size),
             "reason": "ok",
+            "evals_result": getattr(early_stop_model, "evals_result_", {}),
         }
     except Exception as exc:
         logging.warning("⚠️ LightGBM早停细化失败，回退随机搜索最佳参数：%s", exc)
@@ -3153,6 +3863,7 @@ def train_stacking_lgb(
         "final_oof_fold_metrics": final_oof_fold_metrics_df,
         "fold_summary": build_cv_summary_frame(all_fold_metrics_df),
         "oof_detail": oof_detail_df,
+        "lgb_early_stop_info": lgb_early_stop_info,
     }
 
     # 4. 用全部训练池重训最终基础模型
@@ -3172,6 +3883,9 @@ def train_stacking_lgb(
     test_thresholds, test_segment_labels = resolve_threshold_array(y_test_prob, threshold_strategy, X_test_df)
     train_eval = evaluate_binary_probabilities(y_train_valid_array, y_train_prob, train_thresholds)
     test_eval = evaluate_binary_probabilities(np.asarray(y_test), y_test_prob, test_thresholds)
+    train_probability_eval = evaluate_probability_regression_metrics(y_train_valid_array, y_train_prob)
+    valid_probability_eval = evaluate_probability_regression_metrics(y_train_valid_array, meta_oof_prob)
+    test_probability_eval = evaluate_probability_regression_metrics(np.asarray(y_test), y_test_prob)
 
     # 6. 计算评估指标
     metrics = {
@@ -3221,6 +3935,9 @@ def train_stacking_lgb(
         'selected_cat_features': len(selected_cat_cols),
         'selected_total_features': len(selected_num_cols) + len(selected_cat_cols),
     }
+    metrics.update(prefix_probability_regression_metrics("train", train_probability_eval))
+    metrics.update(prefix_probability_regression_metrics("valid", valid_probability_eval))
+    metrics.update(prefix_probability_regression_metrics("test", test_probability_eval))
     metrics.update(build_generalization_diagnostics(metrics))
 
     logging.info("✅ 模型训练完成，评估结果：")
@@ -3255,6 +3972,12 @@ def train_stacking_lgb(
     logging.info(
         "  - OOF-Precision：%.4f | OOF-Recall：%.4f | OOF预测流失率：%.4f",
         metrics['valid_precision'], metrics['valid_recall'], metrics['valid_pred_positive_rate']
+    )
+    logging.info(
+        "  - 概率误差指标：OOF R方=%.4f | OOF RMSE=%.4f | Test R方=%.4f | Test RMSE=%.4f | Test Brier=%.4f",
+        metrics['valid_probability_r2'], metrics['valid_probability_rmse'],
+        metrics['test_probability_r2'], metrics['test_probability_rmse'],
+        metrics['test_probability_brier_score']
     )
     if not final_oof_fold_metrics_df.empty:
         logging.info("  - 5折最终OOF明细：")
@@ -3420,6 +4143,11 @@ def build_multi_seed_cv_artifacts(seed_runs, X_train_valid_df, y_train_valid_arr
         "f1": segmented_oof_metrics["f1"],
         "pred_positive_rate": segmented_oof_metrics["pred_positive_rate"],
     }
+    oof_probability_metrics = evaluate_probability_regression_metrics(y_train_valid_array, ensemble_oof_prob)
+    oof_metrics.update({
+        f"probability_{metric_key}": metric_value
+        for metric_key, metric_value in oof_probability_metrics.items()
+    })
 
     return {
         "base_fold_metrics": pd.concat(base_fold_frames, ignore_index=True, sort=False) if base_fold_frames else pd.DataFrame(),
@@ -3505,6 +4233,12 @@ def train_multi_seed_ensemble(
     test_thresholds, test_segment_labels = resolve_threshold_array(y_test_prob, threshold_strategy, X_test_df)
     train_eval = evaluate_binary_probabilities(y_train_valid_array, y_train_prob, train_thresholds)
     test_eval = evaluate_binary_probabilities(np.asarray(y_test), y_test_prob, test_thresholds)
+    train_probability_eval = evaluate_probability_regression_metrics(y_train_valid_array, y_train_prob)
+    valid_probability_eval = {
+        metric_key: ensemble_oof_metrics.get(f"probability_{metric_key}", np.nan)
+        for metric_key in ["r2", "rmse", "mae", "brier_score"]
+    }
+    test_probability_eval = evaluate_probability_regression_metrics(np.asarray(y_test), y_test_prob)
 
     seed_metrics_df = seed_stability_artifacts.get("seed_metrics", pd.DataFrame())
     blend_lgb_weight = float(pd.to_numeric(seed_metrics_df.get("blend_lgb_weight"), errors="coerce").mean()) if not seed_metrics_df.empty else np.nan
@@ -3554,6 +4288,9 @@ def train_multi_seed_ensemble(
         "seed_model_count": int(len(parsed_seeds)),
         "seed_list_text": ", ".join(str(seed) for seed in parsed_seeds),
     }
+    metrics.update(prefix_probability_regression_metrics("train", train_probability_eval))
+    metrics.update(prefix_probability_regression_metrics("valid", valid_probability_eval))
+    metrics.update(prefix_probability_regression_metrics("test", test_probability_eval))
     metrics.update(build_generalization_diagnostics(metrics))
 
     logging.info("✅ Multi-Seed Ensemble训练完成，评估结果：")
@@ -3591,6 +4328,12 @@ def train_multi_seed_ensemble(
     logging.info(
         "  - 测试Precision：%.4f | 测试Recall：%.4f | 测试F1：%.4f",
         metrics["test_precision"], metrics["test_recall"], metrics["test_f1"]
+    )
+    logging.info(
+        "  - 概率误差指标：OOF R方=%.4f | OOF RMSE=%.4f | Test R方=%.4f | Test RMSE=%.4f | Test Brier=%.4f",
+        metrics["valid_probability_r2"], metrics["valid_probability_rmse"],
+        metrics["test_probability_r2"], metrics["test_probability_rmse"],
+        metrics["test_probability_brier_score"]
     )
 
     return (
@@ -3669,6 +4412,10 @@ def compute_shap_top3_and_export(model, preprocessor, X_test_df, df_test, out_pr
             shap_arr = shap_vals
             logging.info("🔍 使用数组格式的SHAP值")
 
+        shap_arr = np.asarray(shap_arr)
+        if shap_arr.ndim == 3 and shap_arr.shape[-1] > 1:
+            shap_arr = shap_arr[:, :, 1]
+            logging.info("🔍 SHAP三维数组已转换为正类贡献值")
         logging.info(f"🔍 SHAP数组形状: {shap_arr.shape}")
 
     except Exception as e:
@@ -3700,11 +4447,91 @@ def compute_shap_top3_and_export(model, preprocessor, X_test_df, df_test, out_pr
         shap.summary_plot(shap_arr, X_test_trans, feature_names=feature_names, show=False)
         shap_save_path = f"{out_prefix}_shap_summary.png"
         plt.tight_layout()
-        plt.savefig(shap_save_path, dpi=150, bbox_inches='tight')
+        plt.savefig(shap_save_path, dpi=REPORT_PLOT_DPI, bbox_inches='tight')
         plt.close()
         logging.info(f"✅ SHAP图已保存：{shap_save_path}")
     except Exception as e:
         logging.warning(f"❌ SHAP绘图失败：{e}")
+
+    try:
+        plt.figure(figsize=(10, 6))
+        shap.summary_plot(shap_arr, X_test_trans, feature_names=feature_names, plot_type="bar", show=False)
+        shap_bar_path = f"{out_prefix}_shap_bar.png"
+        plt.tight_layout()
+        plt.savefig(shap_bar_path, dpi=REPORT_PLOT_DPI, bbox_inches="tight")
+        plt.close()
+        logging.info("✅ SHAP Bar图已保存：%s", shap_bar_path)
+    except Exception as e:
+        plt.close("all")
+        logging.warning("❌ SHAP Bar图生成失败：%s", e)
+
+    try:
+        mean_abs = np.mean(np.abs(shap_arr), axis=0)
+        top_feature_idx = int(np.argmax(mean_abs))
+        plt.figure(figsize=(8.5, 6))
+        shap.dependence_plot(
+            top_feature_idx,
+            shap_arr,
+            X_test_trans,
+            feature_names=feature_names,
+            show=False,
+        )
+        shap_dep_path = f"{out_prefix}_shap_dependence.png"
+        plt.tight_layout()
+        plt.savefig(shap_dep_path, dpi=REPORT_PLOT_DPI, bbox_inches="tight")
+        plt.close()
+        logging.info("✅ SHAP Dependence图已保存：%s", shap_dep_path)
+    except Exception as e:
+        plt.close("all")
+        logging.warning("❌ SHAP Dependence图生成失败：%s", e)
+
+    def resolve_expected_value():
+        expected_value = getattr(explainer, "expected_value", 0.0)
+        if isinstance(expected_value, (list, tuple, np.ndarray)):
+            arr = np.asarray(expected_value, dtype=float).reshape(-1)
+            if len(arr) > 1:
+                return float(arr[1])
+            if len(arr) == 1:
+                return float(arr[0])
+        return float(expected_value)
+
+    def save_waterfall(row_index, suffix, title):
+        try:
+            expected_value = resolve_expected_value()
+            values = shap_arr[row_index]
+            data_row = np.asarray(X_test_trans[row_index]).reshape(-1)
+            explanation = shap.Explanation(
+                values=values,
+                base_values=expected_value,
+                data=data_row,
+                feature_names=feature_names,
+            )
+            plt.figure(figsize=(10, 6))
+            shap.plots.waterfall(explanation, show=False, max_display=12)
+            plt.title(title, fontsize=12, fontweight="bold")
+            save_path = f"{out_prefix}_{suffix}.png"
+            plt.tight_layout()
+            plt.savefig(save_path, dpi=REPORT_PLOT_DPI, bbox_inches="tight")
+            plt.close()
+            logging.info("✅ SHAP Waterfall图已保存：%s", save_path)
+        except Exception as exc:
+            plt.close("all")
+            logging.warning("❌ SHAP Waterfall图生成失败：%s | %s", suffix, exc)
+
+    try:
+        if {"实际流失标签", "预测流失标签"}.issubset(df_test.columns):
+            actual = pd.to_numeric(df_test["实际流失标签"], errors="coerce").to_numpy()
+            pred = pd.to_numeric(df_test["预测流失标签"], errors="coerce").to_numpy()
+            correct_positions = np.where(actual == pred)[0]
+            error_positions = np.where(actual != pred)[0]
+            if len(correct_positions):
+                save_waterfall(int(correct_positions[0]), "shap_waterfall_correct_sample", "SHAP Waterfall - Correct Prediction")
+            if len(error_positions):
+                save_waterfall(int(error_positions[0]), "shap_waterfall_error_sample", "SHAP Waterfall - Error Case")
+        elif len(df_test):
+            save_waterfall(0, "shap_waterfall_sample", "SHAP Waterfall - Sample Explanation")
+    except Exception as e:
+        logging.warning("❌ SHAP个体解释样本选择失败：%s", e)
 
     return df_test
 
@@ -3743,6 +4570,18 @@ METRIC_LABEL_MAP = {
     "train_recall": "训练集Recall",
     "valid_recall": "验证集Recall",
     "test_recall": "测试集Recall",
+    "train_probability_r2": "训练集概率R方",
+    "valid_probability_r2": "OOF验证概率R方",
+    "test_probability_r2": "测试集概率R方",
+    "train_probability_rmse": "训练集概率RMSE",
+    "valid_probability_rmse": "OOF验证概率RMSE",
+    "test_probability_rmse": "测试集概率RMSE",
+    "train_probability_mae": "训练集概率MAE",
+    "valid_probability_mae": "OOF验证概率MAE",
+    "test_probability_mae": "测试集概率MAE",
+    "train_probability_brier_score": "训练集Brier分数",
+    "valid_probability_brier_score": "OOF验证Brier分数",
+    "test_probability_brier_score": "测试集Brier分数",
     "train_pred_positive_rate": "训练集预测流失率",
     "valid_pred_positive_rate": "验证集预测流失率",
     "test_pred_positive_rate": "测试集预测流失率",
@@ -3775,6 +4614,10 @@ def build_seed_metric_row(random_state, metrics, used_primary_run=False):
         "train_f1", "valid_f1", "test_f1",
         "train_precision", "valid_precision", "test_precision",
         "train_recall", "valid_recall", "test_recall",
+        "train_probability_r2", "valid_probability_r2", "test_probability_r2",
+        "train_probability_rmse", "valid_probability_rmse", "test_probability_rmse",
+        "train_probability_mae", "valid_probability_mae", "test_probability_mae",
+        "train_probability_brier_score", "valid_probability_brier_score", "test_probability_brier_score",
         "train_pred_positive_rate", "valid_pred_positive_rate", "test_pred_positive_rate",
         "train_oof_auc_gap", "train_test_auc_gap", "oof_test_auc_gap", "oof_test_auc_gap_abs",
         "generalization_warning_gap_threshold",
@@ -3814,6 +4657,9 @@ def build_seed_stability_summary(seed_metrics_df):
         "valid_precision", "test_precision",
         "valid_recall", "test_recall",
         "valid_acc", "test_acc",
+        "valid_probability_r2", "test_probability_r2",
+        "valid_probability_rmse", "test_probability_rmse",
+        "valid_probability_brier_score", "test_probability_brier_score",
         "best_threshold",
         "blend_lgb_weight", "blend_lr_weight", "blend_et_weight",
     ]
@@ -3865,6 +4711,10 @@ def build_metrics_export_frames(metrics):
         "train_f1", "valid_f1", "test_f1",
         "train_precision", "valid_precision", "test_precision",
         "train_recall", "valid_recall", "test_recall",
+        "train_probability_r2", "valid_probability_r2", "test_probability_r2",
+        "train_probability_rmse", "valid_probability_rmse", "test_probability_rmse",
+        "train_probability_mae", "valid_probability_mae", "test_probability_mae",
+        "train_probability_brier_score", "valid_probability_brier_score", "test_probability_brier_score",
         "test_pred_positive_rate",
         "best_threshold", "high_risk_threshold", "standard_threshold",
         "target_pred_positive_rate", "min_pred_positive_rate", "max_pred_positive_rate",
@@ -4255,6 +5105,10 @@ def generate_outputs_and_reports(
         test_detail_df["实际流失标签"].to_numpy(dtype=int),
         pd.to_numeric(test_detail_df["流失概率"], errors="coerce").to_numpy(dtype=float),
     )
+    actual_predicted_bin_df = build_actual_vs_predicted_bin_frame(
+        test_detail_df["实际流失标签"].to_numpy(dtype=int),
+        pd.to_numeric(test_detail_df["流失概率"], errors="coerce").to_numpy(dtype=float),
+    )
 
     high_risk_df = df_out_sorted[df_out_sorted["预测流失标签"] == 1].copy()
     if high_risk_df.empty:
@@ -4293,6 +5147,7 @@ def generate_outputs_and_reports(
             "观察名单": watch_df,
             "测试集评估明细": test_detail_df,
             "Top名单评估": topk_metrics_df,
+            "分箱实际预测对比": actual_predicted_bin_df,
             "业务分层摘要": tier_summary_df,
             "结果摘要": summary_df,
         },
@@ -4303,6 +5158,13 @@ def generate_outputs_and_reports(
             "观察名单": ["流失概率", "预测阈值", "风险排名百分位"],
             "测试集评估明细": ["流失概率", "预测阈值", "风险排名百分位"],
             "Top名单评估": ["名单比例", "Precision", "Recall", "基准流失率", "概率截断点"],
+            "分箱实际预测对比": [
+                "mean_predicted_probability",
+                "actual_attrition_rate",
+                "calibration_gap",
+                "min_predicted_probability",
+                "max_predicted_probability",
+            ],
             "业务分层摘要": ["占比", "最高流失概率", "最低流失概率"],
             "结果摘要": ["值"],
         },
@@ -4313,6 +5175,7 @@ def generate_outputs_and_reports(
             "观察名单": ["流失概率"],
             "测试集评估明细": ["流失概率"],
             "Top名单评估": ["Precision", "Recall", "Lift"],
+            "分箱实际预测对比": ["mean_predicted_probability", "actual_attrition_rate", "calibration_gap"],
         },
     )
     logging.info(
@@ -4331,6 +5194,7 @@ def generate_outputs_and_reports(
     )
     logging.info(f"✅ 员工风险预测名单已保存：{pred_save_path}")
     output_manifest["prediction_file"] = pred_save_path
+    release_report_memory("prediction_excel")
 
     # 1.1 去留预测可视化图
     decision_view_name = f"{os.path.basename(out_prefix)}_去留预测可视化.png"
@@ -4341,28 +5205,120 @@ def generate_outputs_and_reports(
         alias_names=["attrition_decision_view.png"],
     )
 
+    # 1.2 测试集真实标签-预测概率R方拟合图
+    r2_fit_name = f"{os.path.basename(out_prefix)}_测试集概率R方拟合图.png"
+    r2_fit_path = plot_probability_r2_fit(
+        test_detail_df["实际流失标签"].to_numpy(dtype=float),
+        pd.to_numeric(test_detail_df["流失概率"], errors="coerce").to_numpy(dtype=float),
+        metrics=metrics,
+        metric_prefix="test",
+        save_name=r2_fit_name,
+        alias_names=["probability_r2_fit.png"],
+        title="Test Set Probability Prediction R-squared Fit",
+    )
+    if r2_fit_path:
+        output_manifest["probability_r2_fit_plot"] = r2_fit_path
+    release_report_memory("probability_r2_fit")
+
+    actual_predicted_plot_name = f"{os.path.basename(out_prefix)}_分箱Actual_vs_Predicted.png"
+    actual_predicted_plot_path = plot_binned_actual_vs_predicted(
+        test_detail_df["实际流失标签"].to_numpy(dtype=int),
+        pd.to_numeric(test_detail_df["流失概率"], errors="coerce").to_numpy(dtype=float),
+        save_name=actual_predicted_plot_name,
+    )
+    if actual_predicted_plot_path:
+        output_manifest["binned_actual_vs_predicted_plot"] = actual_predicted_plot_path
+    release_report_memory("binned_actual_vs_predicted")
+
+    # 1.3 论文/答辩常用分类诊断图
+    test_y_true = test_detail_df["实际流失标签"].to_numpy(dtype=int)
+    test_y_prob = pd.to_numeric(test_detail_df["流失概率"], errors="coerce").to_numpy(dtype=float)
+    test_threshold = pd.to_numeric(test_detail_df["预测阈值"], errors="coerce").to_numpy(dtype=float)
+    classification_plot_name = f"{os.path.basename(out_prefix)}_ROC_PR_混淆矩阵.png"
+    classification_plot_path = plot_classification_diagnostics(
+        test_y_true,
+        test_y_prob,
+        test_threshold,
+        save_name=classification_plot_name,
+    )
+    if classification_plot_path:
+        output_manifest["classification_diagnostics_plot"] = classification_plot_path
+    release_report_memory("classification_diagnostics")
+
+    sigmoid_plot_path = plot_lr_sigmoid_curve(save_name=f"{os.path.basename(out_prefix)}_LR_Sigmoid决策曲线.png")
+    if sigmoid_plot_path:
+        output_manifest["lr_sigmoid_curve"] = sigmoid_plot_path
+    release_report_memory("lr_sigmoid")
+
+    lr_coef_plot_path = plot_lr_coefficients(
+        model,
+        preprocessor,
+        save_name=f"{os.path.basename(out_prefix)}_LR特征系数图.png",
+    )
+    if lr_coef_plot_path:
+        output_manifest["lr_coefficient_plot"] = lr_coef_plot_path
+    release_report_memory("lr_coefficients")
+
+    lgb_gain_plot_path = plot_lgb_gain_importance(
+        model,
+        preprocessor,
+        save_name=f"{os.path.basename(out_prefix)}_LGB_Gain特征重要性.png",
+    )
+    if lgb_gain_plot_path:
+        output_manifest["lgb_gain_importance_plot"] = lgb_gain_plot_path
+    release_report_memory("lgb_gain")
+
+    et_lgb_plot_path = plot_et_lgb_feature_importance_comparison(
+        model,
+        preprocessor,
+        save_name=f"{os.path.basename(out_prefix)}_ET_LGB特征重要性对比.png",
+    )
+    if et_lgb_plot_path:
+        output_manifest["et_lgb_importance_comparison_plot"] = et_lgb_plot_path
+    release_report_memory("et_lgb_importance")
+
+    lgb_training_plot_path = plot_lgb_training_curves(
+        cv_artifacts,
+        save_name=f"{os.path.basename(out_prefix)}_LGB训练轮数曲线.png",
+    )
+    if lgb_training_plot_path:
+        output_manifest["lgb_training_curve_plot"] = lgb_training_plot_path
+    release_report_memory("lgb_training_curve")
+
     # 2. SHAP Top3风险驱动
     if shap is not None:
-        shap_detail_df = df_out_sorted.head(min(SHAP_TOP3_MAX_ROWS, len(df_out_sorted))).copy()
-        shap_feature_df = full_feature_df.loc[shap_detail_df["源数据行号"].tolist()].copy()
-        df_out_shap = compute_shap_top3_and_export(model, preprocessor, shap_feature_df, shap_detail_df, out_prefix)
-        if df_out_shap is not None:
-            shap_save_path = f"{out_prefix}_Top3风险驱动.xlsx"
-            df_out_shap = df_out_shap.sort_values("流失概率", ascending=False).reset_index(drop=True)
-            save_friendly_excel(
-                shap_save_path,
-                sheet_frames={
-                    "Top3驱动明细": df_out_shap,
-                },
-                percent_cols_map={
-                    "Top3驱动明细": ["流失概率", "预测阈值"],
-                },
-                heatmap_cols_map={
-                    "Top3驱动明细": ["流失概率"],
-                },
+        try:
+            shap_rows = min(SHAP_TOP3_MAX_ROWS, len(df_out_sorted))
+            logging.info("SHAP解释样本数：%s（可用HR_SHAP_TOP3_MAX_ROWS调整）", shap_rows)
+            shap_detail_df = df_out_sorted.head(shap_rows).copy(deep=False)
+            shap_feature_df = full_feature_df.loc[shap_detail_df["源数据行号"].tolist()].copy(deep=False)
+            df_out_shap = compute_shap_top3_and_export(model, preprocessor, shap_feature_df, shap_detail_df, out_prefix)
+            if df_out_shap is not None:
+                shap_save_path = f"{out_prefix}_Top3风险驱动.xlsx"
+                df_out_shap = df_out_shap.sort_values("流失概率", ascending=False).reset_index(drop=True)
+                save_friendly_excel(
+                    shap_save_path,
+                    sheet_frames={
+                        "Top3驱动明细": df_out_shap,
+                    },
+                    percent_cols_map={
+                        "Top3驱动明细": ["流失概率", "预测阈值"],
+                    },
+                    heatmap_cols_map={
+                        "Top3驱动明细": ["流失概率"],
+                    },
+                )
+                logging.info(f"✅ Top3风险驱动名单已保存：{shap_save_path}")
+                output_manifest["top3_driver_file"] = shap_save_path
+        except MemoryError as exc:
+            logging.warning(
+                "❌ SHAP解释导出因内存不足跳过，不影响模型训练结果。可调小HR_SHAP_TOP3_MAX_ROWS后重跑：%s",
+                exc,
             )
-            logging.info(f"✅ Top3风险驱动名单已保存：{shap_save_path}")
-            output_manifest["top3_driver_file"] = shap_save_path
+        except Exception as exc:
+            logging.warning("❌ SHAP解释导出失败，已跳过，不影响模型训练结果：%s", exc)
+        finally:
+            release_report_memory("shap_export")
 
     # 3. 政策缺口岗位（macro_index < 50）
     if 'macro_index' in df_emp.columns:

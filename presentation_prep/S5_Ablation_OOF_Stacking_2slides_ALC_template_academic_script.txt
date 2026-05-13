@@ -1,0 +1,5 @@
+Slide 1.
+S4 established LightGBM as a strong nonlinear predictor. This section compresses the validation logic into two evidence layers. First, the ablation study evaluates component necessity by removing or replacing key modules and observing the performance change. The comparison covers lexical TF-IDF, semantic Sentence-BERT features, and the LR, ET and LightGBM base models. This turns the final score into component-level evidence rather than a single isolated result.
+
+Slide 2.
+The second layer evaluates fusion and operational use. OOF stacking trains the meta learner on predictions produced by models that did not see the corresponding training samples, reducing in-sample optimism. The meta learner combines LR, ET and LightGBM probabilities, along with average, spread and disagreement features. The full model reaches OOF AUC 0.9793 and Test AUC 0.9847, with a 0.0054 gap. For HR action, the Top 20 percent risk group reaches Precision 0.9700, Recall 0.8151 and Lift 4.0756. The next section uses SHAP to explain individual risk drivers.

@@ -1,0 +1,8 @@
+Slide 1.
+S4 established LightGBM as a strong nonlinear predictor. S5 presents the validation framework for the final ensemble. The final score is treated as a technical solution supported by three evidence layers: component contribution, leakage-controlled fusion, and HR actionability.
+
+Slide 2.
+The method layer combines ablation analysis and OOF stacking. Ablation removes or replaces key components and measures the marginal performance change. OOF stacking gives each training sample a prediction from models that did not train on that sample. These fair predictions become meta-features for the logistic meta learner, which combines LR, ET and LightGBM more flexibly than uniform averaging.
+
+Slide 3.
+The empirical evidence supports the design. The full model reaches OOF AUC 0.9793 and Test AUC 0.9847, with only a 0.0054 gap. For HR action, the Top 20 percent risk group reaches Precision 0.9700, Recall 0.8151, and Lift 4.0756. Therefore, the model produces a focused intervention list. The next section uses SHAP to explain individual risk drivers.
